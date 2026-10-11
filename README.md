@@ -11,6 +11,18 @@ Design: RoboPhaedrus1992/agent `docs/superpowers/specs/2026-10-11-robo-worker-de
     uv run pytest
     uv run ruff check && uv run ruff format --check && uv run ty check
 
+## Trust model
+
+- All callers are one trust domain: one person's agent and that person's own sessions.
+  Any caller can read, cancel, or resume any job, and `list_jobs` shows every prompt.
+- A worker runs `claude -p` with `bypassPermissions` and runs the code of the repo it checks out, such as its tests.
+  That code sees the plan OAuth token in its environment.
+  Submit only repos that you trust.
+- The server and its workers share the unix user `robo-worker`, so a worker can read the caller tokens and change the service files.
+  Issue #1 tracks a separate user for the workers.
+- `default_tags`, `deny_tags`, and `deny_bundles` are denylists.
+  A tag or bundle that the llmenv config adds later is open to jobs until you deny it.
+
 ## Operations
 
 - Host setup: `docs/host-setup.md`.

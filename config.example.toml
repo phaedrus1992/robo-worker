@@ -38,6 +38,8 @@ rate_limit_retry_seconds = 900
 [llmenv]
 # Tags added through LLMENV_EXTRA_TAGS when a job names none.
 default_tags = []
+# deny_tags and deny_bundles are denylists: a tag or bundle that is not listed is allowed.
+# List each tag or bundle that a worker must never get, such as one that sets an output style.
 deny_tags = []
 # Bundle names that must never appear in LLMENV_ACTIVE_BUNDLES for a worker.
 deny_bundles = []

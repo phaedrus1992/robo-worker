@@ -47,3 +47,15 @@ jobs:
           version: "0.13.0"
       - run: uvx --from actionlint-py==1.7.12.25 actionlint
       - run: uvx zizmor==1.30.1 --persona=regular .github/workflows/
+
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43 # 4.0.0
+        with:
+          bats-version: 1.14.0
+      - run: shellcheck scripts/*.sh
+      - run: bats tests/shell

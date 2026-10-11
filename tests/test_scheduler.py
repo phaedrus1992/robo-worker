@@ -401,3 +401,19 @@ async def test_auth_pause_is_an_event(
                 await anyio.sleep(0.05)
     kinds = [e["kind"] for e in store.events(job.id, 0)[0]]
     assert "queue_paused" in kinds
+
+
+async def test_home_settings_with_an_api_key_helper_fail_the_job(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv, isolated_home: Path
+) -> None:
+    make_origin(tmp_path)
+    (isolated_home / ".claude").mkdir()
+    (isolated_home / ".claude" / "settings.json").write_text('{"apiKeyHelper": "/bin/key"}')
+    set_env("success.jsonl")
+    scheduler = Scheduler(config, store)
+    job = scheduler.submit("o/r", "p", None, "agent")
+    async with running(scheduler):
+        failed = await wait_state(store, job.id, JobState.FAILED)
+    assert failed.reason is not None
+    assert "apiKeyHelper" in failed.reason
+    assert records(tmp_path) == []

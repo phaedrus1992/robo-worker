@@ -33,6 +33,16 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Keep the developer's ~/.claude settings out of every test."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
 def write_secret(path: Path, text: str) -> Path:
     path.write_text(text)
     path.chmod(0o600)

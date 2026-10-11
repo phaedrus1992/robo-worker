@@ -40,11 +40,15 @@ def main() -> int:
             "env": sorted(os.environ),
             "cwd": os.getcwd(),
         }
+        if "--system-prompt-file" in sys.argv:
+            system_file = sys.argv[sys.argv.index("--system-prompt-file") + 1]
+            entry["system_file_text"] = Path(system_file).read_text(encoding="utf-8")
         with open(record, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
     fixtures = os.environ["FAKE_CLAUDE_FIXTURES"].split(os.pathsep)
     sys.stdout.write(Path(fixtures[min(index, len(fixtures) - 1)]).read_text(encoding="utf-8"))
     sys.stdout.flush()
+    sys.stderr.write(os.environ.get("FAKE_CLAUDE_STDERR", ""))
     touch = os.environ.get("FAKE_CLAUDE_TOUCH")
     if touch:
         Path(touch).write_text("dirty\n", encoding="utf-8")

@@ -36,7 +36,9 @@ async def test_ask_returns_text_and_usage(
     call = json.loads((tmp_path / "record.jsonl").read_text())
     assert call["stdin"] == "say hello"
     argv = call["argv"]
-    assert argv[argv.index("--system-prompt") + 1] == "be brief"
+    assert "be brief" not in argv
+    assert call["system_file_text"] == "be brief"
+    assert list((config.state_root / "ask").glob("system-*")) == []
     assert argv[-2:] == ["--tools", ""]
     assert "--strict-mcp-config" in argv
     assert "--no-session-persistence" in argv
@@ -50,7 +52,7 @@ async def test_ask_without_system_prompt(
     config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     asker, _ = _asker(config, monkeypatch, tmp_path, "ask_success.jsonl")
-    assert "--system-prompt" not in asker.argv(None)
+    assert "--system-prompt-file" not in asker.argv(None)
 
 
 async def test_empty_prompt(
@@ -123,3 +125,33 @@ async def test_malformed_stream_line_is_logged(
     result = await asker.ask("hi", None, "agent")
     assert result.text == "hello"
     assert "stream_error" in caplog.text
+
+
+async def test_ask_without_init_fails(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = tmp_path / "no_init.jsonl"
+    lines = (FIXTURES / "ask_success.jsonl").read_text().splitlines()
+    fixture.write_text("\n".join(line for line in lines if '"subtype":"init"' not in line))
+    asker, _ = _asker(config, monkeypatch, tmp_path, str(fixture))
+    with pytest.raises(AskError, match="init event"):
+        await asker.ask("hi", None, "agent")
+
+
+async def test_no_result_error_carries_stderr(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    asker, _ = _asker(
+        config, monkeypatch, tmp_path, "crash.jsonl", FAKE_CLAUDE_STDERR="Error: bad flag"
+    )
+    with pytest.raises(AskError, match="bad flag"):
+        await asker.ask("hi", None, "agent")
+
+
+async def test_missing_claude_names_the_config_key(
+    config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = replace(config, claude_bin=str(tmp_path / "no-claude"))
+    asker, _ = _asker(missing, monkeypatch, tmp_path, "ask_success.jsonl")
+    with pytest.raises(AskError, match=r"bins\.claude"):
+        await asker.ask("hi", None, "agent")

@@ -1,0 +1,5 @@
+{"type":"system","subtype":"hook_started","hook_event":"SessionStart","session_id":"s1"}
+{"type":"system","subtype":"init","session_id":"s1","apiKeySource":"none","output_style":"default","permissionMode":"bypassPermissions"}
+{"type":"assistant","session_id":"s1","message":{"content":[{"type":"text","text":"working"}]}}
+{"type":"rate_limit_event","session_id":"s1","rate_limit_info":{"status":"allowed_warning","resetsAt":1791871200,"rateLimitType":"seven_day","utilization":0.82}}
+{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"session_id":"s1","result":"{\"status\":\"done\"}","structured_output":{"status":"done","summary":"opened PR","pr_url":"https://github.com/o/r/pull/1","issues_filed":[]},"total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":20,"costUSD":0.25}}}

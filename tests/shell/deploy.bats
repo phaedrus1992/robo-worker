@@ -10,7 +10,11 @@ setup() {
 #!/usr/bin/env bash
 input="$(cat)"
 echo "ssh $* :: $input" >>"$LOG"
-if [[ "$input" == *"rev-parse HEAD"* ]]; then echo "$OLD_SHA"; fi
+if [[ "$input" == *"rev-parse HEAD"* ]]; then
+  [[ -n "${FAIL_REVPARSE:-}" ]] && exit 1
+  echo "$OLD_SHA"
+fi
+if [[ -n "${FAIL_FETCH:-}" && "$input" == *"git fetch"* ]]; then exit 1; fi
 if [[ -n "${FAIL_SYNC:-}" && "$input" == *"uv sync"* && "$input" != *"$OLD_SHA"* ]]; then
   exit 1
 fi
@@ -21,9 +25,16 @@ EOF
 n=$(($(cat "$COUNT" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$COUNT"
 echo "curl $n $*" >>"$LOG"
-if [[ "$n" -eq 1 ]]; then echo "{\"running\": ${RUNNING:-0}}"; exit 0; fi
-if [[ "$n" -le "${HEALTH_FAIL_UNTIL:-1}" ]]; then exit 22; fi
-echo '{"ok": true}'
+if [[ "$n" -eq 1 ]]; then
+  [[ -n "${CURL_DOWN:-}" ]] && exit 7
+  printf '{"running": %s}\n%s' "${RUNNING:-0}" "${FIRST_CODE:-200}"
+  exit 0
+fi
+if [[ "$n" -le "${HEALTH_FAIL_UNTIL:-1}" ]]; then
+  printf '{"ok": false, "problems": ["token expired"]}\n503'
+  exit 0
+fi
+printf '{"ok": true}\n200'
 EOF
   chmod +x "$BIN/ssh" "$BIN/curl"
   export PATH="$BIN:$PATH" ROBO_WORKER_HEALTH_TRIES=2 ROBO_WORKER_HEALTH_DELAY=0
@@ -83,4 +94,52 @@ EOF
   ROBO_WORKER_UNIT='robo-worker;reboot' run scripts/deploy.sh host http://h/health
   [ "$status" -eq 2 ]
   [ ! -e "$LOG" ]
+}
+
+@test "refuses when the running job count cannot be read" {
+  CURL_DOWN=1 run scripts/deploy.sh host http://h/health
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"cannot read the running job count"* ]]
+  ! grep -q systemctl "$LOG"
+}
+
+@test "--force deploys when the running job count cannot be read" {
+  CURL_DOWN=1 run scripts/deploy.sh --force host http://h/health
+  [ "$status" -eq 0 ]
+}
+
+@test "reads running jobs from a 503 health body" {
+  FIRST_CODE=503 RUNNING=2 run scripts/deploy.sh host http://h/health
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"2 job(s) running"* ]]
+}
+
+@test "a failed health check prints the service problems" {
+  HEALTH_FAIL_UNTIL=99 run scripts/deploy.sh host http://h/health v0.1.0
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"problem: token expired"* ]]
+}
+
+@test "a host that starts with a dash exits 2" {
+  run scripts/deploy.sh -oProxyCommand=x http://h/health
+  [ "$status" -eq 2 ]
+  [ ! -e "$LOG" ]
+}
+
+@test "a health url that is not http exits 2" {
+  run scripts/deploy.sh host file:///etc/passwd
+  [ "$status" -eq 2 ]
+  [ ! -e "$LOG" ]
+}
+
+@test "exit 6 when the current commit cannot be read" {
+  FAIL_REVPARSE=1 run scripts/deploy.sh host http://h/health
+  [ "$status" -eq 6 ]
+  ! grep -q systemctl "$LOG"
+}
+
+@test "exit 6 when git fetch fails" {
+  FAIL_FETCH=1 run scripts/deploy.sh host http://h/health
+  [ "$status" -eq 6 ]
+  ! grep -q "checkout" "$LOG"
 }

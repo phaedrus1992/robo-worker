@@ -15,7 +15,8 @@ Design: RoboPhaedrus1992/agent `docs/superpowers/specs/2026-10-11-robo-worker-de
 
 - Host setup: `docs/host-setup.md`.
 - Deploy: `scripts/deploy.sh <ssh-host> http://<lan-address>:<port>/health [git-ref]`.
-  The script refuses to restart while jobs run, unless you pass `--force`.
+  The script refuses to restart while jobs run, or when it cannot read the job count, unless you pass `--force`.
+  Exit codes: 0 deployed, 2 usage, 3 rolled back, 4 rollback failed, 5 refused, 6 nothing changed (cannot read or fetch on the host).
 - Health: `GET /health` needs no token. It returns 503 when a job cannot run.
 - Job files: `<state_root>/jobs/<id>/` holds `job.json`, `events.jsonl`, `stream.jsonl`, `stderr.log`, and `mcp.json`.
 - Usage: `<state_root>/usage.jsonl` has one line for each job run and each ask.

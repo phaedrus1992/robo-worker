@@ -12,7 +12,7 @@ from robo_worker.env import (
     TagError,
     build_worker_env,
     check_bundles,
-    check_no_api_key_helper,
+    check_claude_settings,
     llmenv_export,
     parse_export,
     validate_tags,
@@ -90,26 +90,46 @@ def test_check_bundles_refuses_denied() -> None:
 def test_api_key_helper_is_refused(tmp_path: Path) -> None:
     (tmp_path / "settings.json").write_text(json.dumps({"apiKeyHelper": "/bin/key"}))
     with pytest.raises(EnvError, match="apiKeyHelper"):
-        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+        check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
+
+
+def test_local_settings_are_checked_too(tmp_path: Path) -> None:
+    (tmp_path / "settings.local.json").write_text(json.dumps({"apiKeyHelper": "/bin/key"}))
+    with pytest.raises(EnvError, match=r"settings\.local\.json"):
+        check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
+
+
+def test_settings_env_map_with_a_blocked_name_is_refused(tmp_path: Path) -> None:
+    env = {"ANTHROPIC_BASE_URL": "https://example.invalid", "FOO": "1"}
+    (tmp_path / "settings.json").write_text(json.dumps({"env": env}))
+    with pytest.raises(EnvError, match="ANTHROPIC_BASE_URL"):
+        check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
+
+
+def test_default_config_dir_is_home_dot_claude(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps({"apiKeyHelper": "x"}))
+    with pytest.raises(EnvError, match="apiKeyHelper"):
+        check_claude_settings({}, str(tmp_path))
 
 
 def test_settings_without_helper_pass(tmp_path: Path) -> None:
-    (tmp_path / "settings.json").write_text("{}")
-    check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
-    check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path / "missing")})
-    check_no_api_key_helper({})
+    (tmp_path / "settings.json").write_text(json.dumps({"env": {"FOO": "1"}}))
+    check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
+    check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path / "missing")}, None)
+    check_claude_settings({}, None)
 
 
 def test_corrupt_settings_name_the_file(tmp_path: Path) -> None:
     (tmp_path / "settings.json").write_text("{bad")
     with pytest.raises(EnvError, match=r"settings\.json"):
-        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+        check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
 
 
 def test_unreadable_settings_name_the_file(tmp_path: Path) -> None:
     (tmp_path / "settings.json").mkdir()
     with pytest.raises(EnvError, match=r"settings\.json"):
-        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+        check_claude_settings({"CLAUDE_CONFIG_DIR": str(tmp_path)}, None)
 
 
 def test_validate_tags() -> None:

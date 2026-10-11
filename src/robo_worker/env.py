@@ -90,22 +90,44 @@ def check_bundles(llmenv_vars: Mapping[str, str], deny_bundles: Sequence[str]) -
         )
 
 
-def check_no_api_key_helper(llmenv_vars: Mapping[str, str]) -> None:
-    """Raise EnvError when the Claude config dir sets apiKeyHelper, which outranks the token."""
+_SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+
+def check_claude_settings(llmenv_vars: Mapping[str, str], home: str | None) -> None:
+    """Raise EnvError when the user settings could make claude bill another account.
+
+    apiKeyHelper outranks the plan token, and a settings ``env`` map can set the same
+    names that the worker allowlist removes.
+    """
     config_dir = llmenv_vars.get("CLAUDE_CONFIG_DIR")
+    if not config_dir and home:
+        config_dir = str(Path(home) / ".claude")
     if not config_dir:
         return
-    settings = Path(config_dir) / "settings.json"
+    for name in _SETTINGS_FILES:
+        _check_settings_file(Path(config_dir) / name)
+
+
+def _check_settings_file(settings: Path) -> None:
     try:
         data = json.loads(settings.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return
     except (OSError, ValueError) as exc:
         raise EnvError(f"cannot read {settings}: {exc}") from exc
-    if isinstance(data, dict) and "apiKeyHelper" in data:
+    if not isinstance(data, dict):
+        return
+    if "apiKeyHelper" in data:
         raise EnvError(
             f"{settings} sets apiKeyHelper, which takes precedence over the plan token. "
             "Remove it from the llmenv bundles of this worker."
+        )
+    env = data.get("env")
+    blocked = sorted(n for n in env if _blocked(n)) if isinstance(env, dict) else []
+    if blocked:
+        raise EnvError(
+            f"{settings} sets {blocked} in its env map, which changes the account claude "
+            "bills. Remove them from the llmenv bundles of this worker."
         )
 
 

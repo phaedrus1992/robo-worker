@@ -21,7 +21,7 @@ from robo_worker.env import (
     EnvError,
     build_worker_env,
     check_bundles,
-    check_no_api_key_helper,
+    check_claude_settings,
     llmenv_export,
     validate_tags,
 )
@@ -293,7 +293,7 @@ class Scheduler:
                 self._cfg.llmenv_bin, cwd, tags, self._parent, self._cfg.max_prepare_seconds
             )
         check_bundles(llmenv_vars, self._cfg.deny_bundles)
-        check_no_api_key_helper(llmenv_vars)
+        check_claude_settings(llmenv_vars, self._parent.get("HOME"))
         return build_worker_env(
             parent=self._parent,
             llmenv_vars=llmenv_vars,

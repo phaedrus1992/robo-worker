@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"s1","apiKeySource":"none","output_style":"default"}
+{"type":"rate_limit_event","session_id":"s1","rate_limit_info":{"status":"rejected","resetsAt":1791871200,"rateLimitType":"five_hour"}}

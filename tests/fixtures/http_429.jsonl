@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"s1","apiKeySource":"none","output_style":"default"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":429,"session_id":"s1","result":"","structured_output":null,"total_cost_usd":0,"usage":{},"modelUsage":{}}

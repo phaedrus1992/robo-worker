@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"s2","apiKeySource":"none","output_style":"default"}
+{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"session_id":"s2","result":"hello","structured_output":null,"total_cost_usd":0.01,"usage":{"input_tokens":3,"output_tokens":1},"modelUsage":{"claude-haiku-5-5":{"costUSD":0.01}}}

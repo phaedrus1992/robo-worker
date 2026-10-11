@@ -1,0 +1,53 @@
+# robo-worker config. Every key is required.
+
+[server]
+# The LAN address to bind. Callers reach the MCP endpoint at <public_url>/mcp.
+listen_host = "192.168.1.20"
+listen_port = 8765
+# The worker's own Claude session calls report_progress at this URL.
+public_url = "http://192.168.1.20:8765"
+# Host header values the MCP transport accepts (DNS rebinding protection).
+allowed_hosts = ["192.168.1.20:8765"]
+
+[paths]
+workspace_root = "/home/robo-worker/work"
+state_root = "/home/robo-worker/state"
+# TOML file, mode 0600: [callers] with one `name = "token"` line per caller.
+callers_file = "/home/robo-worker/secrets/callers.toml"
+# Output of `claude setup-token`, mode 0600.
+oauth_token_file = "/home/robo-worker/secrets/claude-oauth-token"
+
+[auth]
+# The date of the `claude setup-token` run. The token is valid for one year.
+oauth_token_created = 2026-10-12
+token_warn_days = 30
+# Values of apiKeySource in the stream init event that bill the plan.
+allowed_key_sources = ["none"]
+
+[limits]
+max_parallel_jobs = 2
+max_parallel_asks = 2
+max_job_seconds = 14400
+max_ask_seconds = 300
+kill_grace_seconds = 30
+max_interruptions = 3
+rate_limit_retry_seconds = 900
+
+[llmenv]
+# Tags added through LLMENV_EXTRA_TAGS when a job names none.
+default_tags = []
+deny_tags = []
+# Bundle names that must never appear in LLMENV_ACTIVE_BUNDLES for a worker.
+deny_bundles = []
+# Output styles that stop a job when the init event reports them.
+deny_output_styles = ["ben"]
+# Names copied from the service environment into the worker environment.
+extra_env = ["GH_CONFIG_DIR"]
+
+[bins]
+claude = "claude"
+llmenv = "llmenv"
+git = "git"
+
+[git]
+clone_url_template = "https://github.com/{owner}/{name}.git"

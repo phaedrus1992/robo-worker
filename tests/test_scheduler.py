@@ -341,7 +341,9 @@ async def test_cancel_during_a_dirty_prepare_is_not_lost(
     set_env("success.jsonl")
     entered, release = anyio.Event(), anyio.Event()
 
-    async def blocked_checkout(git_bin: str, root: Path, repo: RepoName, template: str) -> Path:
+    async def blocked_checkout(
+        git_bin: str, root: Path, repo: RepoName, template: str, timeout: float
+    ) -> Path:
         entered.set()
         await release.wait()
         raise DirtyCheckout("dirty on purpose")

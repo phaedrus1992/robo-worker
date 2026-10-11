@@ -31,6 +31,7 @@ class Config:
     max_parallel_asks: int
     max_job_seconds: int
     max_ask_seconds: int
+    max_prepare_seconds: int
     kill_grace_seconds: int
     max_interruptions: int
     rate_limit_retry_seconds: int
@@ -142,6 +143,7 @@ def load_config(path: Path) -> Config:
         max_parallel_asks=limits.positive("max_parallel_asks"),
         max_job_seconds=limits.positive("max_job_seconds"),
         max_ask_seconds=limits.positive("max_ask_seconds"),
+        max_prepare_seconds=limits.positive("max_prepare_seconds"),
         kill_grace_seconds=limits.positive("kill_grace_seconds"),
         max_interruptions=limits.positive("max_interruptions"),
         rate_limit_retry_seconds=limits.positive("rate_limit_retry_seconds"),

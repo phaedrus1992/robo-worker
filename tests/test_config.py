@@ -40,6 +40,7 @@ def test_public_url_trailing_slash_is_removed(tmp_path: Path) -> None:
     [
         ("[limits]", "[limitz]", "missing [limits] table"),
         ("max_job_seconds = 14400\n", "", "missing limits.max_job_seconds"),
+        ("max_prepare_seconds = 600", "max_prepare_seconds = 0", "greater than 0"),
         ("max_job_seconds = 14400", "max_job_seconds = 0", "greater than 0"),
         ("max_job_seconds = 14400", 'max_job_seconds = "1"', "must be int"),
         ("max_job_seconds = 14400", "max_job_seconds = true", "must be int"),

@@ -93,6 +93,7 @@ def config(tmp_path: Path, fake_claude: Path, fake_llmenv: Path) -> Config:
         max_parallel_asks=2,
         max_job_seconds=20,
         max_ask_seconds=20,
+        max_prepare_seconds=20,
         kill_grace_seconds=1,
         max_interruptions=2,
         rate_limit_retry_seconds=60,

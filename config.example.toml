@@ -29,6 +29,8 @@ max_parallel_jobs = 2
 max_parallel_asks = 2
 max_job_seconds = 14400
 max_ask_seconds = 300
+# Limit for each git and llmenv command that prepares a job.
+max_prepare_seconds = 600
 kill_grace_seconds = 30
 max_interruptions = 3
 rate_limit_retry_seconds = 900

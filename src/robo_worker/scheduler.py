@@ -271,6 +271,7 @@ class Scheduler:
                 self._cfg.workspace_root,
                 parse_repo(job.repo),
                 self._cfg.clone_url_template,
+                self._cfg.max_prepare_seconds,
             )
         except DirtyCheckout as exc:
             self._pause_repo(job, f"checkout_dirty: {exc}")
@@ -286,7 +287,9 @@ class Scheduler:
 
     async def _worker_env(self, cwd: Path, tags: list[str], token: str) -> dict[str, str]:
         async with self._export_lock:
-            llmenv_vars = await llmenv_export(self._cfg.llmenv_bin, cwd, tags, self._parent)
+            llmenv_vars = await llmenv_export(
+                self._cfg.llmenv_bin, cwd, tags, self._parent, self._cfg.max_prepare_seconds
+            )
         check_bundles(llmenv_vars, self._cfg.deny_bundles)
         check_no_api_key_helper(llmenv_vars)
         return build_worker_env(
@@ -362,7 +365,7 @@ class Scheduler:
 
     async def _check_dirty_after(self, job: Job, cwd: Path) -> None:
         try:
-            dirty = await is_dirty(self._cfg.git_bin, cwd)
+            dirty = await is_dirty(self._cfg.git_bin, cwd, self._cfg.max_prepare_seconds)
         except CheckoutError as exc:
             self._pause_repo(job, f"checkout_unknown: {exc}")
             return

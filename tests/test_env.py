@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 
+import anyio
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -127,7 +128,9 @@ def test_validate_tags_refuses_bad_input(tags: object) -> None:
 
 @pytest.mark.anyio
 async def test_llmenv_export_passes_tags(tmp_path: Path, fake_llmenv: Path) -> None:
-    env = await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python", "dev"], dict(os.environ))
+    env = await llmenv_export(
+        str(fake_llmenv), tmp_path, ["lang-python", "dev"], dict(os.environ), 20
+    )
     assert env["LLMENV_ACTIVE_TAGS"] == "lang-python, dev"
 
 
@@ -135,4 +138,17 @@ async def test_llmenv_export_passes_tags(tmp_path: Path, fake_llmenv: Path) -> N
 async def test_llmenv_export_failure_names_the_tags(tmp_path: Path, fake_llmenv: Path) -> None:
     parent = {**os.environ, "FAKE_LLMENV_EXIT": "3"}
     with pytest.raises(EnvError, match=r"lang-python.*exit 3.*failed on purpose"):
-        await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python"], parent)
+        await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python"], parent, 20)
+
+
+@pytest.mark.anyio
+async def test_slow_llmenv_export_times_out(tmp_path: Path, fake_llmenv: Path) -> None:
+    parent = {**os.environ, "FAKE_LLMENV_SLEEP": "30"}
+    with anyio.fail_after(10), pytest.raises(EnvError, match="max_prepare_seconds"):
+        await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python"], parent, 1)
+
+
+@pytest.mark.anyio
+async def test_missing_llmenv_names_the_config_key(tmp_path: Path) -> None:
+    with pytest.raises(EnvError, match=r"bins\.llmenv"):
+        await llmenv_export(str(tmp_path / "none"), tmp_path, [], dict(os.environ), 20)

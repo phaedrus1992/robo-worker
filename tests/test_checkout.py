@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 
+import anyio
 import pytest
 
 from robo_worker.checkout import (
@@ -15,6 +16,7 @@ from tests.conftest import make_origin
 
 pytestmark = [pytest.mark.anyio, pytest.mark.usefixtures("isolated_git")]
 REPO = RepoName("o", "r")
+LIMIT = 20
 
 
 def _template(tmp_path: Path) -> str:
@@ -23,19 +25,19 @@ def _template(tmp_path: Path) -> str:
 
 async def test_clones_a_missing_checkout(tmp_path: Path) -> None:
     make_origin(tmp_path)
-    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
     assert path == checkout_path(tmp_path / "work", REPO) == tmp_path / "work" / "o" / "r"
     assert (path / "README.md").read_text() == "hi\n"
-    assert not await is_dirty("git", path)
+    assert not await is_dirty("git", path, LIMIT)
 
 
 async def test_fetches_an_existing_checkout(tmp_path: Path) -> None:
     origin = make_origin(tmp_path)
-    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
     (origin / "NEW.md").write_text("new\n")
     subprocess.run(["git", "-C", str(origin), "add", "NEW.md"], check=True)
     subprocess.run(["git", "-C", str(origin), "commit", "-q", "-m", "new"], check=True)
-    await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+    await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
     log = subprocess.run(
         ["git", "-C", str(path), "log", "--oneline", "origin/main"],
         check=True,
@@ -47,12 +49,27 @@ async def test_fetches_an_existing_checkout(tmp_path: Path) -> None:
 
 async def test_refuses_a_dirty_checkout(tmp_path: Path) -> None:
     make_origin(tmp_path)
-    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
     (path / "scratch.txt").write_text("wip\n")
     with pytest.raises(DirtyCheckout, match=r"resume_queue\('o/r'\)"):
-        await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+        await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
 
 
 async def test_clone_failure_names_the_command(tmp_path: Path) -> None:
     with pytest.raises(CheckoutError, match="clone"):
-        await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path))
+        await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
+
+
+async def test_slow_git_times_out(tmp_path: Path) -> None:
+    slow = tmp_path / "slow-git"
+    slow.write_text("#!/bin/sh\nsleep 30\n")
+    slow.chmod(0o755)
+    with anyio.fail_after(10), pytest.raises(CheckoutError, match="max_prepare_seconds"):
+        await prepare_checkout(str(slow), tmp_path / "work", REPO, _template(tmp_path), 1)
+
+
+async def test_missing_git_names_the_config_key(tmp_path: Path) -> None:
+    with pytest.raises(CheckoutError, match=r"bins\.git"):
+        await prepare_checkout(
+            str(tmp_path / "no-git"), tmp_path / "work", REPO, _template(tmp_path), LIMIT
+        )

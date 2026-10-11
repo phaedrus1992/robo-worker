@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -13,6 +14,7 @@ def main() -> int:
     if code:
         print("fake llmenv: export failed on purpose", file=sys.stderr)
         return code
+    time.sleep(float(os.environ.get("FAKE_LLMENV_SLEEP", "0")))
     output = os.environ.get("FAKE_LLMENV_OUTPUT")
     if output:
         sys.stdout.write(Path(output).read_text(encoding="utf-8"))

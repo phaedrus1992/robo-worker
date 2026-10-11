@@ -8,6 +8,8 @@ from pathlib import Path
 
 import anyio
 
+from robo_worker.proc_output import stderr_tail
+
 # These names change which account claude bills, or which provider it calls. Precedence:
 # https://code.claude.com/docs/en/authentication#authentication-precedence
 BLOCKED_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
@@ -17,7 +19,6 @@ BASE_NAMES = ("HOME", "PATH", "LANG")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Shape only. No comma, because LLMENV_EXTRA_TAGS is a comma-separated list.
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
-_STDERR_TAIL = 500
 
 
 class EnvError(RuntimeError):
@@ -109,15 +110,24 @@ def check_no_api_key_helper(llmenv_vars: Mapping[str, str]) -> None:
 
 
 async def llmenv_export(
-    llmenv_bin: str, cwd: Path, tags: Sequence[str], parent: Mapping[str, str]
+    llmenv_bin: str, cwd: Path, tags: Sequence[str], parent: Mapping[str, str], timeout: float
 ) -> dict[str, str]:
     """Run ``llmenv export`` in ``cwd`` with ``tags`` added, and return its variables."""
     env = {**parent, "LLMENV_EXTRA_TAGS": ", ".join(tags)}
-    result = await anyio.run_process([llmenv_bin, "export"], cwd=cwd, env=env, check=False)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")[-_STDERR_TAIL:]
+    where = f"in {cwd} with tags {list(tags)}"
+    try:
+        with anyio.fail_after(timeout):
+            result = await anyio.run_process([llmenv_bin, "export"], cwd=cwd, env=env, check=False)
+    except TimeoutError:
         raise EnvError(
-            f"llmenv export failed in {cwd} with tags {list(tags)}: "
-            f"exit {result.returncode}: {stderr.strip()}"
+            f"llmenv export {where} ran longer than max_prepare_seconds ({timeout}s)"
+        ) from None
+    except OSError as exc:
+        raise EnvError(
+            f"cannot run {llmenv_bin}: {exc}. Check the bins.llmenv config key."
+        ) from exc
+    if result.returncode != 0:
+        raise EnvError(
+            f"llmenv export failed {where}: exit {result.returncode}: {stderr_tail(result.stderr)}"
         )
     return parse_export(result.stdout.decode("utf-8", errors="replace"))

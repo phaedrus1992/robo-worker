@@ -1,6 +1,7 @@
 """Run one claude -p process and turn its stream into a RunOutcome."""
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,12 +14,14 @@ from anyio.abc import Process
 from robo_worker.config import Config
 from robo_worker.stream import InitEvent, RateLimitEvent, ResultEvent, StreamError, parse_line
 
+_log = logging.getLogger(__name__)
+
 # One line holds one event. A large tool result fits; a runaway process does not.
 MAX_LINE_BYTES = 64 * 1024 * 1024
 CONTINUE_PROMPT = "Continue the task from the point where you stopped."
 STATUS_VALUES = frozenset({"done", "blocked", "failed"})
 _HTTP_TOO_MANY = 429
-_HTTP_AUTH = frozenset({401, 403})
+AUTH_HTTP_STATUSES = frozenset({401, 403})
 
 RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -97,6 +100,7 @@ class StreamState:
     limited: RateLimitEvent | None = None
     result: ResultEvent | None = None
     violation: str | None = None
+    stdin_error: str | None = None
 
 
 def build_argv(claude_bin: str, spec: RunSpec) -> list[str]:
@@ -115,6 +119,10 @@ def build_argv(claude_bin: str, spec: RunSpec) -> list[str]:
         json.dumps(RESULT_SCHEMA),
         "--append-system-prompt",
         WORKER_INSTRUCTIONS.format(job_id=spec.job_id),
+        # Project and local settings come from the checkout, so a repo could set env such as
+        # ANTHROPIC_BASE_URL there. The worker setup comes from llmenv, a user source.
+        "--setting-sources",
+        "user",
         # --mcp-config takes several values, so it stays last and nothing follows it.
         "--mcp-config",
         str(spec.mcp_config_path),
@@ -166,22 +174,45 @@ def _limit_outcome(state: StreamState, usage: dict[str, Any] | None) -> RunOutco
 def _error_outcome(result: ResultEvent, state: StreamState, usage: dict[str, Any]) -> RunOutcome:
     if result.api_error_status == _HTTP_TOO_MANY or state.limited:
         return _limit_outcome(state, usage)
-    if result.api_error_status in _HTTP_AUTH:
+    if result.api_error_status in AUTH_HTTP_STATUSES:
         return RunOutcome(
             "auth", f"claude auth failed with HTTP {result.api_error_status}", usage=usage
         )
     return RunOutcome("failed", f"claude ended with result {result.subtype!r}", usage=usage)
 
 
-def outcome_from(state: StreamState, exit_code: int | None) -> RunOutcome:
-    """Map what the stream showed, and the exit code, to one outcome."""
+def _no_result_reason(state: StreamState, exit_code: int | None) -> str:
+    reason = (
+        f"claude exited with code {exit_code} and gave no result. "
+        "Read stderr.log and stream.jsonl in the job directory."
+    )
+    if state.stdin_error:
+        reason += f" The prompt did not reach claude: {state.stdin_error}"
+    return reason
+
+
+def _stream_failure(state: StreamState, exit_code: int | None) -> RunOutcome | None:
+    """Return the outcome when the stream stops the run before a usable result."""
     if state.violation:
         return RunOutcome("failed", state.violation)
-    result = state.result
-    if result is None:
+    if state.init is None:
+        # The policy check reads the init event, so without it the auth source is unknown.
+        return RunOutcome("failed", NO_INIT_REASON)
+    if state.result is None:
         if state.limited:
             return _limit_outcome(state, None)
-        return RunOutcome("failed", f"claude exited with code {exit_code} and gave no result")
+        return RunOutcome("failed", _no_result_reason(state, exit_code))
+    return None
+
+
+def outcome_from(state: StreamState, exit_code: int | None) -> RunOutcome:
+    """Map what the stream showed, and the exit code, to one outcome."""
+    failure = _stream_failure(state, exit_code)
+    if failure is not None:
+        return failure
+    result = state.result
+    if result is None:
+        raise AssertionError("_stream_failure returns an outcome when there is no result")
     usage = usage_of(result)
     if result.is_error or result.subtype != "success":
         return _error_outcome(result, state, usage)
@@ -191,6 +222,9 @@ def outcome_from(state: StreamState, exit_code: int | None) -> RunOutcome:
         return RunOutcome("failed", error or "result has no structured output", usage=usage)
     reason = output["blocked_reason"] if output["status"] == "blocked" else output["summary"]
     return RunOutcome(cast(OutcomeKind, output["status"]), reason, result=output, usage=usage)
+
+
+NO_INIT_REASON = "claude gave no init event, so its auth source and output style are unknown"
 
 
 def apply_line(line: str, state: StreamState, settings: RunSettings, on_event: EventSink) -> None:
@@ -203,6 +237,8 @@ def apply_line(line: str, state: StreamState, settings: RunSettings, on_event: E
     if isinstance(event, InitEvent):
         state.init = event
         state.violation = check_policy(event, settings)
+    elif event is not None and state.init is None:
+        state.violation = NO_INIT_REASON
     elif isinstance(event, RateLimitEvent):
         data = {"status": event.status, "resets_at": event.resets_at, "type": event.limit_type}
         on_event("rate_limit", data)
@@ -226,20 +262,35 @@ class _Supervisor:
         self.stop_reason: StopReason = "exited"
 
     async def run(self, cancel: anyio.Event) -> None:
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(self._watch_cancel, cancel, tg.cancel_scope)
-            # The send runs beside the reader, so a process that never reads stdin cannot
-            # block the job past max_seconds.
-            tg.start_soon(_send_prompt, self.proc, self.spec.prompt, self.on_event)
-            with anyio.move_on_after(self.settings.max_seconds) as timer:
-                await self._read_stream()
-                if self.state.violation is None:
-                    await self.proc.wait()
-            if timer.cancelled_caught:
-                self.stop_reason = "timeout"
-            tg.cancel_scope.cancel()
-        if self.stop_reason != "exited" or self.state.violation:
-            await self._stop()
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(self._watch_cancel, cancel, tg.cancel_scope)
+                # The send runs beside the reader, so a process that never reads stdin cannot
+                # block the job past max_seconds.
+                tg.start_soon(self._send_prompt)
+                with anyio.move_on_after(self.settings.max_seconds) as timer:
+                    await self._read_stream()
+                    if self.state.violation is None:
+                        await self.proc.wait()
+                if timer.cancelled_caught:
+                    self.stop_reason = "timeout"
+                tg.cancel_scope.cancel()
+        finally:
+            # Also on an error in this class: nothing else limits the process after this.
+            with CancelScope(shield=True):
+                await self._stop()
+
+    async def _send_prompt(self) -> None:
+        stdin = self.proc.stdin
+        if stdin is None:
+            raise RuntimeError("claude process has no stdin pipe")
+        try:
+            await stdin.send(self.spec.prompt.encode("utf-8"))
+            await stdin.aclose()
+        except (anyio.BrokenResourceError, OSError) as exc:
+            # claude exited before it read the prompt; the exit code tells the rest.
+            self.state.stdin_error = str(exc) or type(exc).__name__
+            self.on_event("stdin_error", {"error": self.state.stdin_error})
 
     async def _watch_cancel(self, cancel: anyio.Event, scope: CancelScope) -> None:
         await cancel.wait()
@@ -279,18 +330,10 @@ class _Supervisor:
             await self.proc.wait()
             return
         self.proc.kill()
-        await self.proc.wait()
-
-
-async def _send_prompt(proc: Process, prompt: str, on_event: EventSink) -> None:
-    if proc.stdin is None:
-        raise RuntimeError("claude process has no stdin pipe")
-    try:
-        await proc.stdin.send(prompt.encode("utf-8"))
-        await proc.stdin.aclose()
-    except (anyio.BrokenResourceError, OSError) as exc:
-        # claude exited before it read the prompt; the exit code tells the rest.
-        on_event("stdin_error", {"error": str(exc)})
+        with anyio.move_on_after(self.settings.kill_grace_seconds):
+            await self.proc.wait()
+            return
+        _log.warning("claude pid %s did not exit after SIGKILL", self.proc.pid)
 
 
 async def run_claude(
@@ -307,7 +350,9 @@ async def run_claude(
             supervisor = _Supervisor(proc, spec, settings, on_event)
             await supervisor.run(cancel)
     if supervisor.stop_reason == "timeout":
-        return RunOutcome("timeout", "timeout")
+        return RunOutcome(
+            "timeout", f"timeout: the job ran longer than max_job_seconds ({settings.max_seconds}s)"
+        )
     if supervisor.stop_reason == "cancelled":
         return RunOutcome("cancelled", "cancelled by a caller")
     return outcome_from(supervisor.state, proc.returncode)

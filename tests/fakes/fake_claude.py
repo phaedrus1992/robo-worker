@@ -3,6 +3,7 @@
 FAKE_CLAUDE_FIXTURES holds fixture paths split by os.pathsep. Run N (counted from the lines
 in FAKE_CLAUDE_RECORD) replays fixture N, or the last fixture when N is past the end.
 FAKE_CLAUDE_SKIP_STDIN makes the fake sleep without reading its prompt.
+FAKE_CLAUDE_PIDFILE receives the pid of the fake, so a test can check that it stopped.
 """
 
 import json
@@ -21,6 +22,9 @@ def _run_index(record: str | None) -> int:
 
 
 def main() -> int:
+    pidfile = os.environ.get("FAKE_CLAUDE_PIDFILE")
+    if pidfile:
+        Path(pidfile).write_text(str(os.getpid()), encoding="utf-8")
     if os.environ.get("FAKE_CLAUDE_IGNORE_TERM"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if os.environ.get("FAKE_CLAUDE_SKIP_STDIN"):

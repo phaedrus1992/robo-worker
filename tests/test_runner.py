@@ -94,6 +94,7 @@ async def test_argv_and_stdin(tmp_path: Path, settings: RunSettings) -> None:
     assert "--verbose" in argv
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert json.loads(argv[argv.index("--json-schema") + 1]) == runner.RESULT_SCHEMA
+    assert argv[argv.index("--setting-sources") + 1] == "user"
     assert argv[-2:] == ["--mcp-config", str(tmp_path / "mcp.json")]
 
 
@@ -128,6 +129,7 @@ async def test_crash_names_exit_code(tmp_path: Path, settings: RunSettings) -> N
     outcome, _ = await _run(_spec(tmp_path, "crash.jsonl", FAKE_CLAUDE_EXIT="3"), settings)
     assert outcome.kind == "failed"
     assert "code 3" in outcome.reason
+    assert "stderr.log" in outcome.reason
 
 
 async def test_bad_result_fails(tmp_path: Path, settings: RunSettings) -> None:
@@ -152,7 +154,8 @@ async def test_policy_violation_stops_the_process(
 async def test_timeout(tmp_path: Path, settings: RunSettings) -> None:
     spec = _spec(tmp_path, "crash.jsonl", FAKE_CLAUDE_SLEEP="30")
     outcome, _ = await _run(spec, replace(settings, max_seconds=1))
-    assert (outcome.kind, outcome.reason) == ("timeout", "timeout")
+    assert outcome.kind == "timeout"
+    assert "max_job_seconds" in outcome.reason
 
 
 async def test_timeout_covers_a_prompt_that_is_never_read(
@@ -207,3 +210,37 @@ async def test_missing_binary(tmp_path: Path, settings: RunSettings) -> None:
     )
     assert outcome.kind == "failed"
     assert "cannot start" in outcome.reason
+
+
+async def test_result_without_init_fails(tmp_path: Path, settings: RunSettings) -> None:
+    fixture = tmp_path / "no_init.jsonl"
+    lines = (FIXTURES / "success.jsonl").read_text().splitlines()
+    fixture.write_text("\n".join(line for line in lines if '"subtype":"init"' not in line))
+    outcome, _ = await _run(_spec(tmp_path, fixture), settings)
+    assert outcome.kind == "failed"
+    assert "init event" in outcome.reason
+
+
+async def test_exit_without_any_event_names_init(tmp_path: Path, settings: RunSettings) -> None:
+    fixture = tmp_path / "empty.jsonl"
+    fixture.write_text("")
+    outcome, _ = await _run(_spec(tmp_path, fixture), settings)
+    assert outcome.kind == "failed"
+    assert "init event" in outcome.reason
+
+
+async def test_error_in_event_sink_still_stops_claude(
+    tmp_path: Path, settings: RunSettings
+) -> None:
+    pidfile = tmp_path / "pid"
+    spec = _spec(
+        tmp_path, "success.jsonl", FAKE_CLAUDE_SLEEP="30", FAKE_CLAUDE_PIDFILE=str(pidfile)
+    )
+
+    def broken_sink(kind: str, data: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+    with anyio.fail_after(10), pytest.raises(ExceptionGroup):
+        await run_claude(spec, settings, cancel=anyio.Event(), on_event=broken_sink)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidfile.read_text()), 0)

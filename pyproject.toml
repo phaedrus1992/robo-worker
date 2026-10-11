@@ -8,6 +8,7 @@ license = "MIT"
 dependencies = [
   "anyio==4.15.1",
   "mcp==2.3.0",
+  "pydantic==2.14.1",
   "starlette==1.7.0",
   "uvicorn==0.54.0",
 ]

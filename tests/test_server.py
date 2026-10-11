@@ -1,6 +1,6 @@
 import json
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, MutableMapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -15,7 +15,7 @@ from mcp.client.streamable_http import streamable_http_client
 from robo_worker.asker import Asker
 from robo_worker.config import Config
 from robo_worker.scheduler import Scheduler
-from robo_worker.server import bearer_token, build_app
+from robo_worker.server import BearerAuth, bearer_token, build_app
 from robo_worker.states import JobState
 from robo_worker.store import JobStore
 from tests.conftest import AGENT_TOKEN, FIXTURES, make_origin
@@ -174,3 +174,37 @@ async def test_ask_tool(
     async with serving(app, scheduler) as base, mcp_client(base, AGENT_TOKEN) as client:
         answer = data(await client.call_tool("ask", {"prompt": "say hello"}))
     assert answer["text"] == "hello"
+
+
+async def test_events_refuse_a_boolean_cursor(stack: tuple[Scheduler, Any]) -> None:
+    scheduler, app = stack
+    job = scheduler.submit("o/r", "p", None, "agent")
+    async with serving(app, scheduler) as base, mcp_client(base, AGENT_TOKEN) as client:
+        refused = await client.call_tool("events", {"job_id": job.id, "since": True})
+    assert "since" in error_text(refused)
+
+
+async def test_corrupt_job_reason_reaches_the_caller(stack: tuple[Scheduler, Any]) -> None:
+    scheduler, app = stack
+    job = scheduler.store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    (scheduler.store.job_dir(job.id) / "job.json").write_text("{not json")
+    async with serving(app, scheduler) as base, mcp_client(base, AGENT_TOKEN) as client:
+        refused = await client.call_tool("get_job", {"job_id": job.id})
+    assert "Fix or move the file" in error_text(refused)
+
+
+async def test_websocket_is_refused_before_accept() -> None:
+    sent: list[MutableMapping[str, Any]] = []
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        raise AssertionError("the inner app must not see a websocket")
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        sent.append(message)
+
+    auth = BearerAuth(inner, lambda token: None)
+    await auth({"type": "websocket", "path": "/mcp", "headers": []}, receive, send)
+    assert sent == [{"type": "websocket.close", "code": 1008}]

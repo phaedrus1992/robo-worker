@@ -136,12 +136,12 @@ class Scheduler:
 
     def cancel(self, job_id: str) -> Job:
         job = self._store.get(job_id)
+        if job.state in TERMINAL:
+            raise SubmitError(f"job {job_id} is already {job.state}")
         event = self._cancels.get(job_id)
         if event is not None:
             event.set()
             return job
-        if job.state in TERMINAL:
-            raise SubmitError(f"job {job_id} is already {job.state}")
         return self._store.transition(job, JobState.CANCELLED, "cancelled by a caller")
 
     def resume_queue(self, repo: str) -> None:
@@ -264,6 +264,8 @@ class Scheduler:
             token = read_secret(self._cfg.oauth_token_file)
         except SecretError as exc:
             self.pauses.auth = str(exc)
+            _log.warning("all queues paused for auth: %s", exc)
+            self._store.append_event(job.id, "queue_paused", {"reason": f"auth: {exc}"})
             return None
         try:
             cwd = await prepare_checkout(

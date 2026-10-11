@@ -373,3 +373,31 @@ async def test_a_corrupt_job_does_not_stop_the_queue(
     async with running(scheduler):
         await wait_state(store, job.id, JobState.DONE)
     assert store.unreadable == {broken.id}
+
+
+async def test_cancel_refuses_a_finished_job(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    set_env("success.jsonl")
+    scheduler = Scheduler(config, store)
+    job = scheduler.submit("o/r", "p", None, "agent")
+    scheduler._cancels[job.id] = anyio.Event()
+    store.transition(job, JobState.CANCELLED, "done elsewhere")
+    with pytest.raises(SubmitError, match="already"):
+        scheduler.cancel(job.id)
+
+
+async def test_auth_pause_is_an_event(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    set_env("success.jsonl")
+    config.oauth_token_file.unlink()
+    scheduler = Scheduler(config, store)
+    job = scheduler.submit("o/r", "p", None, "agent")
+    async with running(scheduler):
+        with anyio.fail_after(10):
+            while scheduler.pauses.auth is None:
+                await anyio.sleep(0.05)
+    kinds = [e["kind"] for e in store.events(job.id, 0)[0]]
+    assert "queue_paused" in kinds

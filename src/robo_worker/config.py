@@ -1,5 +1,6 @@
 """Load and check the robo-worker TOML config."""
 
+import string
 import tomllib
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -8,6 +9,7 @@ from typing import Any
 
 _MAX_PORT = 65535
 _SECTIONS = ("server", "paths", "auth", "limits", "llmenv", "bins", "git")
+_CLONE_FIELDS = frozenset({"owner", "name"})
 
 
 class ConfigError(ValueError):
@@ -102,16 +104,24 @@ class _Section:
         return value
 
     def clone_template(self, key: str) -> str:
-        template = self.get(key, str)
-        if "{owner}" not in template or "{name}" not in template:
-            raise ConfigError(f"config: {self._name}.{key} must contain {{owner}} and {{name}}")
-        try:
-            template.format(owner="o", name="n")
-        except (KeyError, IndexError, ValueError) as exc:
+        return check_clone_template(self.get(key, str), f"{self._name}.{key}")
+
+
+def check_clone_template(template: str, where: str = "git.clone_url_template") -> str:
+    """Return ``template`` when its only fields are plain {owner} and {name}."""
+    try:
+        fields = [f for f in string.Formatter().parse(template) if f[1] is not None]
+    except ValueError as exc:
+        raise ConfigError(f"config: {where} is not a valid template: {exc}") from exc
+    for _, field, spec, conversion in fields:
+        # An attribute, an index, a conversion, or a format spec can fail at format time.
+        if field not in _CLONE_FIELDS or spec or conversion:
             raise ConfigError(
-                f"config: {self._name}.{key} may use only {{owner}} and {{name}}: {exc!r}"
-            ) from exc
-        return template
+                f"config: {where} may use only {{owner}} and {{name}}, got {{{field}}}"
+            )
+    if {f[1] for f in fields} != _CLONE_FIELDS:
+        raise ConfigError(f"config: {where} must contain {{owner}} and {{name}}")
+    return template
 
 
 def _read(path: Path) -> dict[str, Any]:

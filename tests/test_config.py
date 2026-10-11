@@ -3,8 +3,10 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-from robo_worker.config import ConfigError, load_config
+from robo_worker.config import ConfigError, check_clone_template, load_config
 
 EXAMPLE = Path(__file__).parent.parent / "config.example.toml"
 
@@ -69,3 +71,21 @@ def test_missing_file(tmp_path: Path) -> None:
 def test_invalid_toml(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="not valid TOML"):
         load_config(_write(tmp_path, "[server"))
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["{owner.real}/{name}", "{owner[0]}/{name}", "{owner!r}/{name}", "{owner:>9}/{name}", "{"],
+)
+def test_clone_template_refuses_field_tricks(template: str) -> None:
+    with pytest.raises(ConfigError, match="clone_url_template"):
+        check_clone_template(template)
+
+
+@given(st.text(max_size=40))
+def test_clone_template_returns_or_raises_config_error(template: str) -> None:
+    try:
+        checked = check_clone_template(template)
+    except ConfigError:
+        return
+    assert checked.format(owner="o", name="n")

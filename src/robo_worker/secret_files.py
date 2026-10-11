@@ -1,8 +1,10 @@
 """Read and write secret files with owner-only permissions."""
 
+import contextlib
 import os
 import re
 import stat
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -72,10 +74,13 @@ def load_callers(path: Path) -> dict[str, str]:
 
 def write_private(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` with mode 0600, through a rename so readers never see half."""
-    tmp = path.with_name(f".{path.name}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    # O_CREAT does not change the mode of a temp file that a crash left behind.
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
+    # mkstemp makes a new 0600 file with a unique name, so two writers never share a temp file.
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise

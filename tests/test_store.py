@@ -111,3 +111,32 @@ def test_a_new_store_reads_existing_jobs(tmp_path: Path) -> None:
     first = JobStore(tmp_path / "state")
     job = first.create(repo="o/r", prompt="p", tags=[], caller="mac")
     assert JobStore(tmp_path / "state").get(job.id) == job
+
+
+def test_all_skips_and_reports_a_corrupt_job(store: JobStore) -> None:
+    good, bad = _job(store), _job(store)
+    (store.job_dir(bad.id) / "job.json").write_text("{not json")
+    assert [j.id for j in store.all()] == [good.id]
+    assert store.unreadable == {bad.id}
+    (store.job_dir(bad.id) / "job.json").unlink()
+    store.all()
+    assert store.unreadable == {bad.id}
+    store.job_dir(bad.id).rmdir()
+    store.all()
+    assert store.unreadable == frozenset()
+
+
+def test_events_skip_a_partial_line(store: JobStore) -> None:
+    job = _job(store)
+    store.append_event(job.id, "started", {})
+    with (store.job_dir(job.id) / "events.jsonl").open("a") as sink:
+        sink.write('{"kind": "torn')
+    events, cursor = store.events(job.id, 0)
+    assert [e["kind"] for e in events] == ["started"]
+    assert cursor == 2
+
+
+def test_job_file_is_private(store: JobStore) -> None:
+    job = _job(store)
+    mode = (store.job_dir(job.id) / "job.json").stat().st_mode & 0o777
+    assert mode == 0o600

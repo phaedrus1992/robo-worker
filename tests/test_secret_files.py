@@ -75,3 +75,18 @@ def test_write_private_resets_mode_of_stale_temp_file(tmp_path: Path) -> None:
     path = tmp_path / "mcp.json"
     write_private(path, "{}")
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_private_removes_its_temp_file_on_failure(tmp_path: Path) -> None:
+    target = tmp_path / "taken"
+    target.mkdir()
+    (target / "x").write_text("keep")
+    with pytest.raises(OSError):
+        write_private(target, "{}")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["taken"]
+
+
+def test_write_private_leaves_no_temp_file(tmp_path: Path) -> None:
+    write_private(tmp_path / "a.json", "1")
+    write_private(tmp_path / "a.json", "2")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.json"]

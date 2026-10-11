@@ -36,7 +36,7 @@ from robo_worker.runner import (
 )
 from robo_worker.secret_files import SecretError, read_secret, write_private
 from robo_worker.states import TERMINAL, JobState
-from robo_worker.store import Job, JobStore
+from robo_worker.store import Job, JobStore, StoreError, UnknownJob
 
 _log = logging.getLogger(__name__)
 
@@ -217,33 +217,38 @@ class Scheduler:
                 continue
             self._busy.add(job.repo)
             self._cancels[job.id] = anyio.Event()
-            tg.start_soon(self._run_job, job.id)
+            tg.start_soon(self._run_job, job.id, job.repo)
 
-    async def _run_job(self, job_id: str) -> None:
-        job = self._store.get(job_id)
+    async def _run_job(self, job_id: str, repo: str) -> None:
         try:
-            await self._execute(job)
+            await self._execute(self._store.get(job_id))
         except Exception as exc:
             # A bug in one job must not stop the queue for every other job.
             _log.exception("job %s failed with an internal error", job_id)
-            self._fail_internal(job, exc)
+            self._settle(
+                job_id,
+                (JobState.QUEUED, JobState.RUNNING),
+                JobState.FAILED,
+                f"internal error: {exc!r}",
+            )
         finally:
             cancel = self._cancels.pop(job_id, None)
             if cancel is not None and cancel.is_set():
-                self._cancel_if_queued(job_id)
-            self._busy.discard(job.repo)
+                # A cancel that arrives while _prepare runs must not be lost when it stops early.
+                self._settle(
+                    job_id, (JobState.QUEUED,), JobState.CANCELLED, "cancelled by a caller"
+                )
+            self._busy.discard(repo)
             self.kick()
 
-    def _cancel_if_queued(self, job_id: str) -> None:
-        # A cancel that arrives while _prepare runs must not be lost when _prepare stops early.
-        current = self._store.get(job_id)
-        if current.state is JobState.QUEUED:
-            self._store.transition(current, JobState.CANCELLED, "cancelled by a caller")
-
-    def _fail_internal(self, job: Job, exc: Exception) -> None:
-        current = self._store.get(job.id)
-        if current.state in (JobState.QUEUED, JobState.RUNNING):
-            self._store.transition(current, JobState.FAILED, f"internal error: {exc!r}")
+    def _settle(self, job_id: str, when: tuple[JobState, ...], new: JobState, reason: str) -> None:
+        """Move the stored job to ``new`` if it is still in one of the ``when`` states."""
+        try:
+            current = self._store.get(job_id)
+            if current.state in when:
+                self._store.transition(current, new, reason)
+        except (StoreError, UnknownJob) as exc:
+            _log.error("cannot move job %s to %s: %s", job_id, new, exc)
 
     async def _execute(self, job: Job) -> None:
         prepared = await self._prepare(job)

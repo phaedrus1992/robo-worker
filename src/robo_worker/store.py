@@ -1,7 +1,7 @@
 """File-backed job records, events, and usage lines."""
 
 import json
-import os
+import logging
 import re
 import time
 import uuid
@@ -10,7 +10,10 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from robo_worker.secret_files import write_private
 from robo_worker.states import JobState, check_transition
+
+_log = logging.getLogger(__name__)
 
 # Shape of uuid4().hex. A strict match keeps a caller's job id from becoming a path.
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
@@ -63,12 +66,6 @@ class Job:
         return cls(**values)
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 class JobStore:
     """One directory per job under ``root/jobs``, plus ``root/usage.jsonl``."""
 
@@ -77,10 +74,16 @@ class JobStore:
         self._jobs.mkdir(parents=True, exist_ok=True)
         self._usage = root / "usage.jsonl"
         self._clock = clock
+        self._unreadable: set[str] = set()
 
     @property
     def usage_path(self) -> Path:
         return self._usage
+
+    @property
+    def unreadable(self) -> frozenset[str]:
+        """Ids of the job files that the last call to all() could not read."""
+        return frozenset(self._unreadable)
 
     def job_dir(self, job_id: str) -> Path:
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
@@ -123,7 +126,8 @@ class JobStore:
 
     def save(self, job: Job) -> None:
         job.updated_at = self._clock()
-        _atomic_write(self.job_dir(job.id) / "job.json", json.dumps(job.to_dict(), indent=2))
+        # Mode 0600: job.json holds the caller prompt and the result.
+        write_private(self.job_dir(job.id) / "job.json", json.dumps(job.to_dict(), indent=2))
 
     def transition(self, job: Job, new: JobState, reason: str | None = None) -> Job:
         check_transition(job.state, new, reason)
@@ -133,7 +137,20 @@ class JobStore:
         return job
 
     def all(self, state: JobState | None = None) -> list[Job]:
-        jobs = [self.get(p.name) for p in self._jobs.iterdir() if _JOB_ID.fullmatch(p.name)]
+        """Return the readable jobs, oldest first. Unreadable job files are logged and skipped."""
+        jobs: list[Job] = []
+        unreadable: set[str] = set()
+        for path in self._jobs.iterdir():
+            if not _JOB_ID.fullmatch(path.name):
+                continue
+            try:
+                jobs.append(self.get(path.name))
+            except (StoreError, UnknownJob) as exc:
+                # One bad file must not stop the queue for every other job.
+                unreadable.add(path.name)
+                if path.name not in self._unreadable:
+                    _log.error("skipping job %s: %s", path.name, exc)
+        self._unreadable = unreadable
         jobs.sort(key=lambda j: j.created_at)
         return [j for j in jobs if state is None or j.state is state]
 
@@ -151,7 +168,16 @@ class JobStore:
             self.get(job_id)
             return [], 0
         lines = path.read_text(encoding="utf-8").splitlines()
-        return [json.loads(line) for line in lines[since:]], len(lines)
+        return [e for e in map(self._event, lines[since:]) if e is not None], len(lines)
+
+    def _event(self, line: str) -> dict[str, Any] | None:
+        # A crash during an append can leave a partial last line. The cursor still counts it.
+        try:
+            event = json.loads(line)
+        except ValueError:
+            _log.warning("skipping an unreadable event line: %.80r", line)
+            return None
+        return event if isinstance(event, dict) else None
 
     def append_usage(self, record: dict[str, Any]) -> None:
         with self._usage.open("a", encoding="utf-8") as sink:

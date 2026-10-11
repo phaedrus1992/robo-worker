@@ -17,7 +17,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from robo_worker.asker import Asker, AskError
 from robo_worker.config import Config
-from robo_worker.health import health_report
+from robo_worker.health import ServiceState, health_report
 from robo_worker.scheduler import Scheduler
 from robo_worker.states import JobState
 from robo_worker.store import Job, UnknownJob
@@ -239,13 +239,8 @@ def build_app(
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
-        report = health_report(
-            cfg,
-            scheduler.pauses,
-            running=scheduler.running_count,
-            today=date.today(),
-            which=shutil.which,
-        )
+        state = ServiceState(scheduler.pauses, scheduler.running_count, scheduler.store.unreadable)
+        report = health_report(cfg, state, today=date.today(), which=shutil.which)
         return JSONResponse(report, status_code=200 if report["ok"] else 503)
 
     inner = mcp.streamable_http_app(

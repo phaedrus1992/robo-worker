@@ -356,3 +356,18 @@ async def test_cancel_during_a_dirty_prepare_is_not_lost(
         release.set()
         cancelled = await wait_state(store, job.id, JobState.CANCELLED)
     assert cancelled.reason == "cancelled by a caller"
+
+
+async def test_a_corrupt_job_does_not_stop_the_queue(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    set_env("success.jsonl")
+    broken = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    (store.job_dir(broken.id) / "job.json").write_text("{not json")
+    scheduler = Scheduler(config, store)
+    scheduler.recover()
+    job = scheduler.submit("o/r", "do it", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, job.id, JobState.DONE)
+    assert store.unreadable == {broken.id}

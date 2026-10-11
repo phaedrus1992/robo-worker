@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from robo_worker.states import IllegalTransition, JobState
 from robo_worker.store import Job, JobStore, StoreError, UnknownJob
@@ -140,3 +142,41 @@ def test_job_file_is_private(store: JobStore) -> None:
     job = _job(store)
     mode = (store.job_dir(job.id) / "job.json").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+_FINITE = st.floats(allow_nan=False, allow_infinity=False)
+_FLAT = st.dictionaries(st.text(max_size=8), st.text(max_size=8) | st.integers() | st.none())
+_JOBS = st.builds(
+    Job,
+    id=st.from_regex(r"[0-9a-f]{32}", fullmatch=True),
+    repo=st.text(),
+    prompt=st.text(),
+    tags=st.lists(st.text()),
+    caller=st.text(),
+    session_id=st.text(),
+    state=st.sampled_from(list(JobState)),
+    created_at=_FINITE,
+    updated_at=_FINITE,
+    reason=st.none() | st.text(),
+    started=st.booleans(),
+    interruptions=st.integers(min_value=0),
+    resume_prompt=st.none() | st.text(),
+    resets_at=st.none() | _FINITE,
+    result=st.none() | _FLAT,
+    usage=st.none() | _FLAT,
+)
+
+
+@given(_JOBS)
+def test_job_round_trips_through_json(job: Job) -> None:
+    assert Job.from_dict(json.loads(json.dumps(job.to_dict()))) == job
+
+
+@given(_JOBS, st.text(min_size=1, max_size=10))
+def test_job_refuses_an_unknown_field(job: Job, key: str) -> None:
+    data = job.to_dict()
+    if key in data:
+        return
+    data[key] = 1
+    with pytest.raises(ValueError, match="unknown fields"):
+        Job.from_dict(data)

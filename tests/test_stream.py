@@ -81,3 +81,47 @@ def test_malformed_lines_raise(line: str) -> None:
 def test_any_json_object_parses_or_raises_stream_error(data: dict) -> None:
     with contextlib.suppress(StreamError):
         parse_line(json.dumps(data))
+
+
+_JSON = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text(max_size=8),
+    lambda inner: st.lists(inner, max_size=3) | st.dictionaries(st.text(max_size=8), inner),
+    max_leaves=12,
+)
+_READ_KEYS = (
+    "rate_limit_info",
+    "structured_output",
+    "usage",
+    "modelUsage",
+    "api_error_status",
+    "total_cost_usd",
+    "result",
+    "is_error",
+    "session_id",
+    "apiKeySource",
+    "output_style",
+)
+
+
+@given(
+    st.sampled_from([("system", "init"), ("rate_limit_event", None), ("result", None)]),
+    st.dictionaries(st.sampled_from(_READ_KEYS), _JSON),
+)
+def test_read_event_types_parse_or_raise_stream_error(
+    kind: tuple[str, str | None], fields: dict[str, object]
+) -> None:
+    data = {**fields, "type": kind[0]}
+    if kind[1]:
+        data["subtype"] = kind[1]
+    with contextlib.suppress(StreamError):
+        parse_line(json.dumps(data))
+
+
+def test_a_huge_number_is_not_a_cost() -> None:
+    event = parse_line('{"type":"result","total_cost_usd":1' + "0" * 400 + "}")
+    assert isinstance(event, ResultEvent)
+    assert event.cost_usd is None

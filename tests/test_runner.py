@@ -2,13 +2,16 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import anyio
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from robo_worker import runner
-from robo_worker.runner import RunOutcome, RunSettings, RunSpec, run_claude
+from robo_worker.runner import RunOutcome, RunSettings, RunSpec, StreamState, run_claude
+from robo_worker.stream import InitEvent, RateLimitEvent, ResultEvent
 from tests.conftest import FIXTURES
 
 pytestmark = pytest.mark.anyio
@@ -244,3 +247,60 @@ async def test_error_in_event_sink_still_stops_claude(
         await run_claude(spec, settings, cancel=anyio.Event(), on_event=broken_sink)
     with pytest.raises(ProcessLookupError):
         os.kill(int(pidfile.read_text()), 0)
+
+
+_TEXT = st.text(max_size=12)
+_OUTPUTS = st.dictionaries(
+    st.sampled_from(["status", "summary", "blocked_reason", "pr_url", "issues_filed"]),
+    st.none() | _TEXT | st.sampled_from(["done", "blocked", "failed"]) | st.lists(_TEXT),
+)
+_RESULTS = st.builds(
+    ResultEvent,
+    subtype=st.sampled_from(["success", "error_during_execution", "other"]),
+    is_error=st.booleans(),
+    api_error_status=st.none() | st.sampled_from([401, 403, 429, 500]),
+    session_id=_TEXT,
+    text=st.none() | _TEXT,
+    structured_output=st.none() | _OUTPUTS,
+    cost_usd=st.none() | st.floats(allow_nan=False, allow_infinity=False),
+    usage=st.just({}),
+    model_usage=st.just({}),
+)
+_STATES = st.builds(
+    StreamState,
+    init=st.none()
+    | st.builds(InitEvent, session_id=_TEXT, api_key_source=_TEXT, output_style=_TEXT),
+    limited=st.none()
+    | st.builds(RateLimitEvent, status=_TEXT, resets_at=st.none(), limit_type=st.none()),
+    result=st.none() | _RESULTS,
+    violation=st.none() | st.text(min_size=1, max_size=12),
+    stdin_error=st.none() | _TEXT,
+)
+
+
+@given(_STATES, st.none() | st.integers())
+def test_outcome_from_is_total(state: StreamState, exit_code: int | None) -> None:
+    outcome = runner.outcome_from(state, exit_code)
+    assert outcome.kind in get_args(runner.OutcomeKind.__value__)
+    assert isinstance(outcome.reason, str)
+    assert outcome.reason
+    if state.violation:
+        assert (outcome.kind, outcome.reason) == ("failed", state.violation)
+
+
+def _done_state(output: dict[str, Any]) -> StreamState:
+    result = ResultEvent("success", False, None, "s", None, output, None, {}, {})
+    return StreamState(init=InitEvent("s", "none", "default"), result=result)
+
+
+def test_blocked_reason_must_be_text() -> None:
+    output = {"status": "blocked", "summary": "x", "issues_filed": [], "blocked_reason": ["a"]}
+    outcome = runner.outcome_from(_done_state(output), 0)
+    assert outcome.kind == "failed"
+    assert "blocked_reason" in outcome.reason
+
+
+def test_empty_summary_still_gives_a_reason() -> None:
+    outcome = runner.outcome_from(_done_state({"status": "done", "summary": ""}), 0)
+    assert outcome.kind == "done"
+    assert outcome.reason

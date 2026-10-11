@@ -49,3 +49,15 @@ def test_any_text_parses_or_raises_repo_name_error(raw: str) -> None:
     assert "/" not in repo.owner
     assert "/" not in repo.name
     assert repo.name not in {".", ".."}
+
+
+@given(st.from_regex(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", fullmatch=True))
+def test_accepted_names_round_trip_through_slug(raw: str) -> None:
+    try:
+        repo = parse_repo(raw)
+    except RepoNameError:
+        return
+    assert parse_repo(repo.slug) == repo
+    assert not repo.owner.startswith("-")
+    assert not repo.owner.endswith("-")
+    assert not repo.name.endswith(".git")

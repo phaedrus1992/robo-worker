@@ -55,7 +55,11 @@ def _str(data: dict[str, Any], key: str, default: str = "") -> str:
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError:
+        # JSON integers have no size limit, and float() refuses one past the float range.
+        return None
 
 
 def _int(value: object) -> int | None:

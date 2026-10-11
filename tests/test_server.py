@@ -9,6 +9,8 @@ import anyio
 import httpx2
 import pytest
 import uvicorn
+from hypothesis import given
+from hypothesis import strategies as st
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
@@ -208,3 +210,17 @@ async def test_websocket_is_refused_before_accept() -> None:
     auth = BearerAuth(inner, lambda token: None)
     await auth({"type": "websocket", "path": "/mcp", "headers": []}, receive, send)
     assert sent == [{"type": "websocket.close", "code": 1008}]
+
+
+@given(st.text(max_size=40))
+def test_bearer_token_never_raises(value: str) -> None:
+    token = bearer_token(value)
+    if token is not None:
+        assert token
+        assert token == token.strip()
+        assert token in value
+
+
+@given(st.text(alphabet=st.characters(exclude_categories=("Z", "C")), min_size=1, max_size=40))
+def test_bearer_prefix_round_trips(token: str) -> None:
+    assert bearer_token("Bearer " + token) == token

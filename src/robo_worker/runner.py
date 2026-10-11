@@ -148,12 +148,14 @@ def validate_result(output: object) -> str | None:
     if not isinstance(output, dict):
         return "result has no structured output"
     status = output.get("status")
-    if status not in STATUS_VALUES:
+    # A list or a dict cannot be looked up in a frozenset, so check the type first.
+    if not isinstance(status, str) or status not in STATUS_VALUES:
         return f"result status {status!r} is not one of {sorted(STATUS_VALUES)}"
     if not isinstance(output.get("summary"), str):
         return "result has no summary"
-    if status == "blocked" and not output.get("blocked_reason"):
-        return "blocked result has no blocked_reason"
+    question = output.get("blocked_reason")
+    if status == "blocked" and not (isinstance(question, str) and question.strip()):
+        return "blocked result has no blocked_reason text"
     return None
 
 
@@ -220,8 +222,11 @@ def outcome_from(state: StreamState, exit_code: int | None) -> RunOutcome:
     error = validate_result(output)
     if error or output is None:
         return RunOutcome("failed", error or "result has no structured output", usage=usage)
-    reason = output["blocked_reason"] if output["status"] == "blocked" else output["summary"]
-    return RunOutcome(cast(OutcomeKind, output["status"]), reason, result=output, usage=usage)
+    status = output["status"]
+    # A done or failed state needs a reason, and the schema allows an empty summary.
+    summary = output["summary"].strip() or f"the worker ended with status {status} and no summary"
+    reason = output["blocked_reason"] if status == "blocked" else summary
+    return RunOutcome(cast(OutcomeKind, status), reason, result=output, usage=usage)
 
 
 NO_INIT_REASON = "claude gave no init event, so its auth source and output style are unknown"

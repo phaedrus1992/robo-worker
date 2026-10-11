@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 from pathlib import Path
 
 import anyio
@@ -172,3 +173,23 @@ async def test_slow_llmenv_export_times_out(tmp_path: Path, fake_llmenv: Path) -
 async def test_missing_llmenv_names_the_config_key(tmp_path: Path) -> None:
     with pytest.raises(EnvError, match=r"bins\.llmenv"):
         await llmenv_export(str(tmp_path / "none"), tmp_path, [], dict(os.environ), 20)
+
+
+_ENV_NAMES = st.from_regex(r"[A-Za-z_][A-Za-z0-9_]{0,20}", fullmatch=True)
+_VALUES = st.text(alphabet=st.characters(exclude_categories=("Cs",), exclude_characters="\x00"))
+
+
+@given(st.dictionaries(_ENV_NAMES, _VALUES, max_size=5))
+def test_parse_export_round_trips_quoted_values(env: dict[str, str]) -> None:
+    text = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in env.items())
+    assert parse_export(text) == env
+
+
+@given(st.lists(st.text(max_size=10), max_size=5))
+def test_accepted_tags_survive_the_extra_tags_join(tags: list[str]) -> None:
+    try:
+        accepted = validate_tags(tags)
+    except TagError:
+        return
+    if accepted:
+        assert ", ".join(accepted).split(", ") == accepted

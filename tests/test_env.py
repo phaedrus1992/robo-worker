@@ -1,0 +1,138 @@
+import json
+import os
+from pathlib import Path
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+
+from robo_worker.env import (
+    EnvError,
+    TagError,
+    build_worker_env,
+    check_bundles,
+    check_no_api_key_helper,
+    llmenv_export,
+    parse_export,
+    validate_tags,
+)
+
+# Same shape as real `llmenv export` output: single quotes, a multi-line value, and the
+# '\'' escape for a quote inside a value.
+EXPORT = """export CLAUDE_CONFIG_DIR='/home/w/.cache/llmenv/claude-code/3/abc'
+export LLMENV_ACTIVE_BUNDLES='base,python-dev'
+export LLMENV_ICM_CONTEXT='## llmenv context
+Bundles: `base`
+
+the tags'\\'' keywords'
+export ANTHROPIC_BASE_URL='https://openrouter.ai/api'
+"""
+
+
+def test_parse_export_handles_quotes_and_newlines() -> None:
+    env = parse_export(EXPORT)
+    assert env["CLAUDE_CONFIG_DIR"] == "/home/w/.cache/llmenv/claude-code/3/abc"
+    assert env["LLMENV_ICM_CONTEXT"].endswith("the tags' keywords")
+    assert "\n" in env["LLMENV_ICM_CONTEXT"]
+
+
+@pytest.mark.parametrize("text", ["export 'unterminated", "export 1BAD=x", "export NOEQUALS"])
+def test_parse_export_refuses_bad_output(text: str) -> None:
+    with pytest.raises(EnvError):
+        parse_export(text)
+
+
+def test_worker_env_is_an_allowlist() -> None:
+    parent = {
+        "HOME": "/home/w",
+        "PATH": "/usr/bin",
+        "LANG": "C.UTF-8",
+        "GH_CONFIG_DIR": "/home/w/.config/gh",
+        "SECRET_THING": "x",
+        "ANTHROPIC_API_KEY": "sk-or-v1-leak",
+        "CLAUDE_CODE_OAUTH_TOKEN": "inherited",
+    }
+    env = build_worker_env(
+        parent=parent,
+        llmenv_vars=parse_export(EXPORT),
+        oauth_token="sk-ant-oat01-real",
+        extra_env=["GH_CONFIG_DIR", "ANTHROPIC_AUTH_TOKEN"],
+    )
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-real"
+    assert env["GH_CONFIG_DIR"] == "/home/w/.config/gh"
+    assert "SECRET_THING" not in env
+    assert not [name for name in env if name.startswith("ANTHROPIC_")]
+
+
+@given(
+    st.dictionaries(st.text(min_size=1, max_size=20), st.text(max_size=5)),
+    st.dictionaries(st.text(min_size=1, max_size=20), st.text(max_size=5)),
+    st.lists(st.text(min_size=1, max_size=20), max_size=5),
+)
+def test_no_blocked_name_ever_reaches_the_worker(
+    parent: dict[str, str], llmenv_vars: dict[str, str], extra: list[str]
+) -> None:
+    env = build_worker_env(
+        parent=parent, llmenv_vars=llmenv_vars, oauth_token="tok", extra_env=extra
+    )
+    assert not [n for n in env if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_"))]
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "tok"
+
+
+def test_check_bundles_refuses_denied() -> None:
+    with pytest.raises(EnvError, match="ben-style"):
+        check_bundles({"LLMENV_ACTIVE_BUNDLES": "base, ben-style"}, ["ben-style"])
+    check_bundles({"LLMENV_ACTIVE_BUNDLES": "base"}, ["ben-style"])
+    check_bundles({}, ["ben-style"])
+
+
+def test_api_key_helper_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text(json.dumps({"apiKeyHelper": "/bin/key"}))
+    with pytest.raises(EnvError, match="apiKeyHelper"):
+        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+
+
+def test_settings_without_helper_pass(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text("{}")
+    check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+    check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path / "missing")})
+    check_no_api_key_helper({})
+
+
+def test_corrupt_settings_name_the_file(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text("{bad")
+    with pytest.raises(EnvError, match=r"settings\.json"):
+        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+
+
+def test_unreadable_settings_name_the_file(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").mkdir()
+    with pytest.raises(EnvError, match=r"settings\.json"):
+        check_no_api_key_helper({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+
+
+def test_validate_tags() -> None:
+    assert validate_tags(["lang-python", "host:still", "a.b_c"]) == [
+        "lang-python",
+        "host:still",
+        "a.b_c",
+    ]
+
+
+@pytest.mark.parametrize("tags", ["lang-python", [""], ["a,b"], ["a b"], ["x" * 65], [5]])
+def test_validate_tags_refuses_bad_input(tags: object) -> None:
+    with pytest.raises(TagError):
+        validate_tags(tags)
+
+
+@pytest.mark.anyio
+async def test_llmenv_export_passes_tags(tmp_path: Path, fake_llmenv: Path) -> None:
+    env = await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python", "dev"], dict(os.environ))
+    assert env["LLMENV_ACTIVE_TAGS"] == "lang-python, dev"
+
+
+@pytest.mark.anyio
+async def test_llmenv_export_failure_names_the_tags(tmp_path: Path, fake_llmenv: Path) -> None:
+    parent = {**os.environ, "FAKE_LLMENV_EXIT": "3"}
+    with pytest.raises(EnvError, match=r"lang-python.*exit 3.*failed on purpose"):
+        await llmenv_export(str(fake_llmenv), tmp_path, ["lang-python"], parent)

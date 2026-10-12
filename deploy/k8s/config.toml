@@ -15,7 +15,7 @@ allowed_hosts = ["robo-worker.phaedrus.svc:8765", "192.168.211.10:30875"]
 workspace_root = "/work"
 state_root = "/state"
 # The job pod template, from the ConfigMap that kustomize generates. See deploy/k8s/job-pod.json.
-job_template = "/etc/robo-worker/job-pod.json"
+job_template = "/etc/robo-worker/config/job-pod.json"
 # Mounted from the robo-worker-secrets Secret. TOML file, no access for others: [callers] with one
 # `name = "token"` line per caller.
 callers_file = "/etc/robo-worker/secrets/callers.toml"

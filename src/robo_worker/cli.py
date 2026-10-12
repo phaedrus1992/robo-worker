@@ -11,6 +11,7 @@ import uvicorn
 
 from robo_worker.asker import Asker
 from robo_worker.config import Config, ConfigError, load_config
+from robo_worker.launcher import K8sLauncher
 from robo_worker.scheduler import Scheduler
 from robo_worker.secret_files import SecretError, load_callers
 from robo_worker.server import build_app
@@ -19,7 +20,7 @@ from robo_worker.store import JobStore
 
 async def serve(cfg: Config, callers: Mapping[str, str]) -> None:
     store = JobStore(cfg.state_root)
-    scheduler = Scheduler(cfg, store)
+    scheduler = Scheduler(cfg, store, launch=K8sLauncher(cfg, cfg.job_template))
     scheduler.recover()
     asker = Asker(cfg, store, scheduler.pauses)
     app = build_app(cfg, scheduler, asker, callers)

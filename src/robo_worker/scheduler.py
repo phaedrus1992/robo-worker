@@ -8,14 +8,19 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 import anyio
 from anyio.abc import TaskGroup
 
-from robo_worker.checkout import CheckoutError, DirtyCheckout, is_dirty, prepare_checkout
+from robo_worker.checkout import (
+    CheckoutError,
+    DirtyCheckout,
+    checkout_path,
+    is_dirty,
+    prepare_checkout,
+)
 from robo_worker.config import Config
 from robo_worker.env import (
     EnvError,
@@ -26,19 +31,15 @@ from robo_worker.env import (
     validate_tags,
 )
 from robo_worker.repos import parse_repo
-from robo_worker.runner import (
-    CONTINUE_PROMPT,
-    EventSink,
-    RunOutcome,
-    RunSettings,
-    RunSpec,
-    run_claude,
-)
+from robo_worker.runner import CONTINUE_PROMPT, RunOutcome, RunSettings, RunSpec
 from robo_worker.secret_files import SecretError, read_secret, write_private
 from robo_worker.states import TERMINAL, JobState
 from robo_worker.store import Job, JobStore, StoreError, UnknownJob
 
 _log = logging.getLogger(__name__)
+
+# The progress token lives beside mcp.json, so a restart can restore the mapping.
+PROGRESS_TOKEN_NAME = "progress_token"
 
 # Progress text lands in an event file that callers poll. Keep each event small.
 MAX_PHASE_CHARS = 64
@@ -59,10 +60,16 @@ class SubmitError(ValueError):
     """A caller request is not valid in the current state."""
 
 
-class RunFn(Protocol):
+class LaunchFn(Protocol):
+    """Run one task and report its outcome. The production one starts a k8s Job."""
+
     async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event, on_event: EventSink
+        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
     ) -> RunOutcome: ...
+
+    async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
+        """Wait for an attempt that an earlier control plane launched. None: no such run exists."""
+        ...
 
 
 @dataclass
@@ -80,12 +87,12 @@ class Scheduler:
         cfg: Config,
         store: JobStore,
         *,
-        run: RunFn = run_claude,
+        launch: LaunchFn,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._cfg = cfg
         self._store = store
-        self._run = run
+        self._launch = launch
         self._clock = clock
         self._parent = dict(os.environ)
         self._settings = RunSettings.from_config(cfg)
@@ -155,6 +162,9 @@ class Scheduler:
     def issue_progress_token(self, job_id: str) -> str:
         token = secrets.token_urlsafe(32)
         self._progress[token] = job_id
+        # A control-plane restart drops this mapping while the job pod still holds the token
+        # in its mcp.json. The job directory carries it, so recover() reads it back.
+        write_private(self._store.job_dir(job_id) / PROGRESS_TOKEN_NAME, token)
         return token
 
     def revoke_progress_token(self, token: str) -> None:
@@ -162,6 +172,13 @@ class Scheduler:
 
     def job_for_progress_token(self, token: str) -> str | None:
         return self._progress.get(token)
+
+    def _restore_progress_token(self, job_id: str) -> None:
+        path = self._store.job_dir(job_id) / PROGRESS_TOKEN_NAME
+        try:
+            self._progress[read_secret(path)] = job_id
+        except SecretError as exc:
+            _log.warning("job %s: cannot restore its progress token: %s", job_id, exc)
 
     def report_progress(self, job_id: str, phase: str, detail: str) -> None:
         if not phase.strip():
@@ -172,10 +189,15 @@ class Scheduler:
     # Lifecycle.
 
     def recover(self) -> None:
-        """Requeue the jobs that a restart stopped, and restore the rate-limit pause."""
+        """Requeue the interrupted jobs, and restore the rate-limit pause.
+
+        A `running` job stays `running`: its pod can outlive this process. `run_forever`
+        attaches to it before it starts anything new.
+        """
         for job in self._store.all(JobState.RUNNING):
-            job.interruptions += 1
-            self._store.transition(job, JobState.INTERRUPTED, "the service stopped during the job")
+            # The job pod may still be alive. Its mcp.json holds a progress token that this
+            # process never issued, so restore the mapping before anything else.
+            self._restore_progress_token(job.id)
         for job in self._store.all(JobState.INTERRUPTED):
             if job.interruptions > self._cfg.max_interruptions:
                 reason = f"interrupted {job.interruptions} times, more than max_interruptions"
@@ -188,6 +210,7 @@ class Scheduler:
 
     async def run_forever(self) -> None:
         async with anyio.create_task_group() as tg:
+            self._reattach_running(tg)
             while True:
                 self._wake = anyio.Event()
                 self._dispatch(tg)
@@ -197,6 +220,30 @@ class Scheduler:
     def _seconds_to_next_check(self) -> float:
         until = self.pauses.rate_limit_until
         return math.inf if until is None else max(0.0, until - self._clock())
+
+    def _reattach_running(self, tg: TaskGroup) -> None:
+        for job in self._store.all(JobState.RUNNING):
+            self._busy.add(job.repo)
+            self._cancels[job.id] = anyio.Event()
+            tg.start_soon(self._watch_attached, job.id, job.repo)
+
+    async def _watch_attached(self, job_id: str, repo: str) -> None:
+        try:
+            job = self._store.get(job_id)
+            cancel = self._cancels[job_id]
+            outcome = await self._launch.attach(job_id, job.attempts, cancel=cancel)
+            if outcome is None:
+                outcome = RunOutcome("interrupted", "the job pod was gone after a service restart")
+            self._finish(job, outcome)
+            path = checkout_path(self._cfg.workspace_root, parse_repo(job.repo))
+            await self._check_dirty_after(job, path)
+        except Exception as exc:
+            _log.exception("job %s failed with an internal error after a restart", job_id)
+            self._settle(job_id, (JobState.RUNNING,), JobState.FAILED, f"internal error: {exc!r}")
+        finally:
+            self._cancels.pop(job_id, None)
+            self._busy.discard(repo)
+            self.kick()
 
     def _release_rate_limit(self) -> None:
         until = self.pauses.rate_limit_until
@@ -306,9 +353,11 @@ class Scheduler:
         if cancel.is_set():
             return RunOutcome("cancelled", "cancelled by a caller")
         token = self.issue_progress_token(job.id)
+        job.attempts += 1
         try:
             spec = RunSpec(
                 job_id=job.id,
+                attempt=job.attempts,
                 cwd=cwd,
                 env=env,
                 prompt=self._prompt_for(job),
@@ -322,8 +371,9 @@ class Scheduler:
             job.resume_prompt = None
             self._store.transition(job, JobState.RUNNING)
             self._store.append_event(job.id, "started", {"resume": spec.resume})
-            on_event = partial(self._store.append_event, job.id)
-            return await self._run(spec, self._settings, cancel=cancel, on_event=on_event)
+            # The job pod appends the run's events to the same store. This process appends
+            # nothing for this job until the outcome comes back, so each file has one writer.
+            return await self._launch(spec, self._settings, cancel=cancel)
         finally:
             self.revoke_progress_token(token)
 
@@ -350,6 +400,9 @@ class Scheduler:
             record = {"time": self._clock(), "kind": "job", "job_id": job.id}
             record |= {"caller": job.caller, "repo": job.repo, **outcome.usage}
             self._store.append_usage(record)
+        if outcome.kind == "interrupted":
+            self._requeue_interrupted(job, outcome.reason)
+            return
         if outcome.kind == "rate_limited":
             retry_at = self._clock() + self._cfg.rate_limit_retry_seconds
             job.resets_at = outcome.resets_at or retry_at
@@ -360,6 +413,18 @@ class Scheduler:
         self._store.append_event(
             job.id, "finished", {"state": job.state.value, "reason": outcome.reason}
         )
+
+    def _requeue_interrupted(self, job: Job, reason: str) -> None:
+        # INTERRUPTED is a pass-through state here: the job goes on to QUEUED or FAILED at once,
+        # so "interrupted" has no entry in _STATE_FOR.
+        job.interruptions += 1
+        self._store.transition(job, JobState.INTERRUPTED, reason)
+        if job.interruptions > self._cfg.max_interruptions:
+            limit = f"interrupted {job.interruptions} times, more than max_interruptions"
+            self._store.transition(job, JobState.FAILED, limit)
+        else:
+            self._store.transition(job, JobState.QUEUED)
+        self._store.append_event(job.id, "finished", {"state": job.state.value, "reason": reason})
 
     def _pause_repo(self, job: Job, reason: str) -> None:
         self.pauses.repos[job.repo] = reason

@@ -31,7 +31,7 @@ def test_example_config_loads() -> None:
     assert cfg.oauth_token_created == date(2026, 10, 12)
     assert cfg.deny_output_styles == ("ben",)
     assert cfg.workspace_root == Path("/work")
-    assert cfg.job_template == Path("/etc/robo-worker/job-pod.json")
+    assert cfg.job_template == Path("/etc/robo-worker/config/job-pod.json")
     assert cfg.kubectl_bin == "kubectl"
     assert cfg.k8s_namespace == "phaedrus"
 
@@ -59,7 +59,7 @@ def test_public_url_trailing_slash_is_removed(tmp_path: Path) -> None:
         ("max_job_seconds = 14400", "max_job_seconds = true", "must be int"),
         ("listen_port = 8765", "listen_port = 70000", "between 1 and 65535"),
         ('"/work"', '"work"', "absolute path"),
-        ('"/etc/robo-worker/job-pod.json"', '"job-pod.json"', "absolute path"),
+        ('"/etc/robo-worker/config/job-pod.json"', '"job-pod.json"', "absolute path"),
         ('namespace = "phaedrus"', 'namespace = ""', "k8s.namespace must not be empty"),
         ("[k8s]", "[k8z]", "missing [k8s] table"),
         ('kubectl = "kubectl"\n', "", "missing bins.kubectl"),

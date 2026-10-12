@@ -46,8 +46,9 @@ blocked_reason.
 End with a result that matches the JSON schema. Put PR and issue URLs in pr_url and issues_filed.
 """
 
+# "interrupted" comes from the launcher, never from run_claude: the job pod died without a result.
 type OutcomeKind = Literal[
-    "done", "blocked", "failed", "rate_limited", "auth", "timeout", "cancelled"
+    "done", "blocked", "failed", "rate_limited", "auth", "timeout", "cancelled", "interrupted"
 ]
 type EventSink = Callable[[str, dict[str, Any]], None]
 type StopReason = Literal["exited", "timeout", "cancelled"]

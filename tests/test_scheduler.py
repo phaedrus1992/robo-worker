@@ -15,11 +15,16 @@ from robo_worker.checkout import DirtyCheckout
 from robo_worker.config import Config
 from robo_worker.env import TagError
 from robo_worker.repos import RepoName, RepoNameError
-from robo_worker.runner import CONTINUE_PROMPT
-from robo_worker.scheduler import MAX_DETAIL_CHARS, Scheduler, SubmitError
+from robo_worker.runner import CONTINUE_PROMPT, RunOutcome, RunSettings, RunSpec
+from robo_worker.scheduler import (
+    MAX_DETAIL_CHARS,
+    PROGRESS_TOKEN_NAME,
+    Scheduler,
+    SubmitError,
+)
 from robo_worker.states import JobState
 from robo_worker.store import Job, JobStore
-from tests.conftest import FIXTURES, make_origin
+from tests.conftest import FIXTURES, make_origin, make_scheduler
 
 pytestmark = [pytest.mark.anyio, pytest.mark.usefixtures("isolated_git")]
 
@@ -87,7 +92,7 @@ async def test_job_runs_to_done(
     export = tmp_path / "export.sh"
     export.write_text("export ANTHROPIC_BASE_URL='https://openrouter.ai/api'\n")
     set_env("success.jsonl", FAKE_LLMENV_OUTPUT=str(export))
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "do it", ["lang-python"], "agent")
     async with running(scheduler):
         done = await wait_state(store, job.id, JobState.DONE)
@@ -117,7 +122,7 @@ async def test_blocked_then_resumed(
 ) -> None:
     make_origin(tmp_path)
     set_env("blocked.jsonl", "success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "do it", None, "mac")
     async with running(scheduler):
         blocked = await wait_state(store, job.id, JobState.BLOCKED)
@@ -133,7 +138,7 @@ async def test_resume_refuses_a_job_that_is_not_blocked(
     config: Config, store: JobStore, set_env: SetEnv
 ) -> None:
     set_env("success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "do it", None, "mac")
     with pytest.raises(SubmitError, match="not blocked"):
         scheduler.resume(job.id, "x")
@@ -146,7 +151,7 @@ async def test_rate_limit_pauses_all_queues(
     make_origin(tmp_path, "o", "s")
     set_env("rate_limited.jsonl", "success.jsonl")
     clock = Clock()
-    scheduler = Scheduler(config, store, clock=clock)
+    scheduler = make_scheduler(config, store, clock=clock)
     first = scheduler.submit("o/r", "first", None, "agent")
     async with running(scheduler):
         limited = await wait_state(store, first.id, JobState.RATE_LIMITED)
@@ -167,7 +172,7 @@ async def test_dirty_checkout_pauses_the_repo(
 ) -> None:
     make_origin(tmp_path)
     set_env("success.jsonl", FAKE_CLAUDE_TOUCH="scratch.txt")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     first = scheduler.submit("o/r", "one", None, "agent")
     async with running(scheduler):
         await wait_state(store, first.id, JobState.DONE)
@@ -199,23 +204,133 @@ async def test_recover_after_restart(config: Config, store: JobStore, set_env: S
     limited.resets_at = clock.now + 100
     store.transition(limited, JobState.RATE_LIMITED, "limit")
 
-    scheduler = Scheduler(config, store, clock=clock)
+    scheduler = make_scheduler(config, store, clock=clock)
     scheduler.recover()
 
-    requeued = store.get(running_job.id)
-    assert (requeued.state, requeued.interruptions) == (JobState.QUEUED, 1)
-    failed = store.get(worn_out.id)
-    assert failed.state is JobState.FAILED
-    assert failed.reason is not None
-    assert "interrupted 3 times" in failed.reason
+    # A running job's pod can outlive the control plane, so recover() leaves it running.
+    assert store.get(running_job.id).state is JobState.RUNNING
     assert store.get(blocked.id).state is JobState.BLOCKED
     assert store.get(limited.id).state is JobState.RATE_LIMITED
     assert scheduler.pauses.rate_limit_until == clock.now + 100
 
+    # The in-process launcher has nothing to attach to, so both running jobs are interrupted.
+    async with running(scheduler):
+        failed = await wait_state(store, worn_out.id, JobState.FAILED)
+        requeued = await wait_state(store, running_job.id, JobState.QUEUED)
+    assert failed.reason is not None
+    assert f"interrupted {config.max_interruptions + 1} times" in failed.reason
+    assert requeued.interruptions == 1
+
+
+class AttachLauncher:
+    """Attach returns a recorded outcome, as K8sLauncher does for a pod that outlived a restart."""
+
+    def __init__(self, outcome: RunOutcome) -> None:
+        self.outcome = outcome
+        self.launches = 0
+        self.attached: list[tuple[str, int]] = []
+
+    async def __call__(
+        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
+    ) -> RunOutcome:
+        self.launches += 1
+        return self.outcome
+
+    async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
+        self.attached.append((job_id, attempt))
+        return self.outcome
+
+
+class ScriptedLauncher:
+    """Each launch returns the next outcome and records its RunSpec."""
+
+    def __init__(self, outcomes: list[RunOutcome]) -> None:
+        self._outcomes = outcomes
+        self.specs: list[RunSpec] = []
+
+    async def __call__(
+        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
+    ) -> RunOutcome:
+        self.specs.append(spec)
+        return self._outcomes.pop(0)
+
+    async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
+        return None
+
+
+async def test_restart_attaches_instead_of_launching(
+    tmp_path: Path, config: Config, store: JobStore
+) -> None:
+    make_origin(tmp_path)
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    job.attempts = 2
+    store.transition(job, JobState.RUNNING)
+    launcher = AttachLauncher(RunOutcome("done", "ok", result={"status": "done"}))
+    scheduler = make_scheduler(config, store, launch=launcher)
+    scheduler.recover()
+
+    async with running(scheduler):
+        finished = await wait_state(store, job.id, JobState.DONE)
+
+    assert launcher.launches == 0
+    assert launcher.attached == [(job.id, 2)]
+    assert finished.interruptions == 0
+    kinds = [e["kind"] for e in store.events(job.id, 0)[0]]
+    assert "started" not in kinds
+
+
+async def test_restart_restores_the_progress_token(config: Config, store: JobStore) -> None:
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    first = make_scheduler(config, store)
+    token = first.issue_progress_token(job.id)
+    store.transition(job, JobState.RUNNING)
+    assert (store.job_dir(job.id) / PROGRESS_TOKEN_NAME).exists()
+
+    second = make_scheduler(config, store)
+    second.recover()
+
+    assert second.job_for_progress_token(token) == job.id
+
+
+async def test_interrupted_outcome_requeues_and_resumes(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    set_env("success.jsonl")
+    make_origin(tmp_path)
+    launcher = ScriptedLauncher(
+        [RunOutcome("interrupted", "pod_failed: OOMKilled"), RunOutcome("done", "ok")]
+    )
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    scheduler = make_scheduler(config, store, launch=launcher)
+    async with running(scheduler):
+        finished = await wait_state(store, job.id, JobState.DONE, JobState.FAILED)
+
+    assert finished.state is JobState.DONE
+    assert finished.interruptions == 1
+    assert finished.attempts == 2
+    assert [s.attempt for s in launcher.specs] == [1, 2]
+    assert [s.resume for s in launcher.specs] == [False, True]
+    assert launcher.specs[1].prompt == CONTINUE_PROMPT
+
+
+async def test_too_many_interruptions_fail_the_job(
+    tmp_path: Path, config: Config, store: JobStore
+) -> None:
+    make_origin(tmp_path)
+    launcher = AttachLauncher(RunOutcome("interrupted", "pod_failed: Evicted"))
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    scheduler = make_scheduler(config, store, launch=launcher)
+    async with running(scheduler):
+        failed = await wait_state(store, job.id, JobState.FAILED)
+
+    assert launcher.launches == config.max_interruptions + 1
+    assert failed.reason is not None
+    assert "more than max_interruptions" in failed.reason
+
 
 async def test_submit_refuses_bad_input(config: Config, store: JobStore, set_env: SetEnv) -> None:
     set_env("success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     with pytest.raises(SubmitError, match="deny_tags"):
         scheduler.submit("o/r", "p", ["blocked-tag"], "agent")
     with pytest.raises(TagError):
@@ -233,7 +348,7 @@ async def test_denied_bundle_fails_before_claude(
     export = tmp_path / "export.sh"
     export.write_text("export LLMENV_ACTIVE_BUNDLES='base,ben-style'\n")
     set_env("success.jsonl", FAKE_LLMENV_OUTPUT=str(export))
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         failed = await wait_state(store, job.id, JobState.FAILED)
@@ -247,7 +362,7 @@ async def test_llmenv_failure_names_the_tags(
 ) -> None:
     make_origin(tmp_path)
     set_env("success.jsonl", FAKE_LLMENV_EXIT="2")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", ["lang-python"], "agent")
     async with running(scheduler):
         failed = await wait_state(store, job.id, JobState.FAILED)
@@ -260,7 +375,7 @@ async def test_auth_error_pauses_every_queue(
 ) -> None:
     make_origin(tmp_path)
     set_env("auth_error.jsonl", "success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     first = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         await wait_state(store, first.id, JobState.FAILED)
@@ -277,7 +392,7 @@ async def test_missing_token_file_pauses_and_keeps_the_job(
     make_origin(tmp_path)
     set_env("success.jsonl")
     config.oauth_token_file.unlink()
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         await anyio.sleep(0.5)
@@ -291,7 +406,7 @@ async def test_cancel_queued_and_running(
 ) -> None:
     make_origin(tmp_path)
     set_env("crash.jsonl", FAKE_CLAUDE_SLEEP="30")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     first = scheduler.submit("o/r", "one", None, "agent")
     second = scheduler.submit("o/r", "two", None, "agent")
     async with running(scheduler):
@@ -310,7 +425,7 @@ async def test_parallel_limit(
     make_origin(tmp_path, "o", "r")
     make_origin(tmp_path, "o", "s")
     set_env("success.jsonl", FAKE_CLAUDE_SLEEP="1")
-    scheduler = Scheduler(replace(config, max_parallel_jobs=1), store)
+    scheduler = make_scheduler(replace(config, max_parallel_jobs=1), store)
     first = scheduler.submit("o/r", "one", None, "agent")
     second = scheduler.submit("o/s", "two", None, "agent")
     async with running(scheduler):
@@ -321,7 +436,7 @@ async def test_parallel_limit(
 
 async def test_progress_tokens(config: Config, store: JobStore, set_env: SetEnv) -> None:
     set_env("success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     token = scheduler.issue_progress_token(job.id)
     assert scheduler.job_for_progress_token(token) == job.id
@@ -349,7 +464,7 @@ async def test_cancel_during_a_dirty_prepare_is_not_lost(
         raise DirtyCheckout("dirty on purpose")
 
     monkeypatch.setattr(scheduler_module, "prepare_checkout", blocked_checkout)
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         with anyio.fail_after(5):
@@ -367,7 +482,7 @@ async def test_a_corrupt_job_does_not_stop_the_queue(
     set_env("success.jsonl")
     broken = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
     (store.job_dir(broken.id) / "job.json").write_text("{not json")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     scheduler.recover()
     job = scheduler.submit("o/r", "do it", None, "agent")
     async with running(scheduler):
@@ -379,7 +494,7 @@ async def test_cancel_refuses_a_finished_job(
     tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
 ) -> None:
     set_env("success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     scheduler._cancels[job.id] = anyio.Event()
     store.transition(job, JobState.CANCELLED, "done elsewhere")
@@ -393,7 +508,7 @@ async def test_auth_pause_is_an_event(
     make_origin(tmp_path)
     set_env("success.jsonl")
     config.oauth_token_file.unlink()
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         with anyio.fail_after(10):
@@ -410,7 +525,7 @@ async def test_home_settings_with_an_api_key_helper_fail_the_job(
     (isolated_home / ".claude").mkdir()
     (isolated_home / ".claude" / "settings.json").write_text('{"apiKeyHelper": "/bin/key"}')
     set_env("success.jsonl")
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
         failed = await wait_state(store, job.id, JobState.FAILED)

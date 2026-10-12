@@ -1,3 +1,4 @@
+import os
 import stat
 from pathlib import Path
 
@@ -22,8 +23,31 @@ def test_read_secret_strips_whitespace(tmp_path: Path) -> None:
     assert read_secret(_secret(tmp_path / "t", "sk-ant-oat01-x\n")) == "sk-ant-oat01-x"
 
 
-def test_read_secret_refuses_group_readable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [0o640, 0o440])
+def test_read_secret_accepts_own_group_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    # A k8s Secret volume gives root:<fsGroup> 0440 or 0640, and fsGroup is the service's group.
+    path = _secret(tmp_path / "t", "x", mode)
+    monkeypatch.setattr(os, "getegid", lambda: path.stat().st_gid)
+    assert read_secret(path) == "x"
+
+
+def test_read_secret_refuses_other_group_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = _secret(tmp_path / "t", "x", 0o640)
+    monkeypatch.setattr(os, "getegid", lambda: path.stat().st_gid + 1)
+    with pytest.raises(SecretError, match="chmod 600"):
+        read_secret(path)
+
+
+@pytest.mark.parametrize("mode", [0o604, 0o644, 0o660, 0o602, 0o620])
+def test_read_secret_refuses_others_and_group_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    path = _secret(tmp_path / "t", "x", mode)
+    monkeypatch.setattr(os, "getegid", lambda: path.stat().st_gid)
     with pytest.raises(SecretError, match="chmod 600"):
         read_secret(path)
 

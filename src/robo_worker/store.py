@@ -45,6 +45,8 @@ class Job:
     reason: str | None = None
     started: bool = False
     interruptions: int = 0
+    # Pod runs so far. The launcher names each k8s Job from it, so no two runs share a name.
+    attempts: int = 0
     resume_prompt: str | None = None
     resets_at: float | None = None
     result: dict[str, Any] | None = None

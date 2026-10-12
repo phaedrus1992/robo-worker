@@ -64,6 +64,8 @@ class RunSpec:
     mcp_config_path: Path
     stream_path: Path
     stderr_path: Path
+    # The pod run number of this job. The k8s launcher names each Job from it.
+    attempt: int = 1
 
 
 @dataclass(frozen=True)

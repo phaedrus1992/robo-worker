@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 _MAX_PORT = 65535
-_SECTIONS = ("server", "paths", "auth", "limits", "llmenv", "bins", "git")
+_SECTIONS = ("server", "paths", "auth", "limits", "llmenv", "k8s", "bins", "git")
 _CLONE_FIELDS = frozenset({"owner", "name"})
 
 
@@ -24,6 +24,7 @@ class Config:
     allowed_hosts: tuple[str, ...]
     workspace_root: Path
     state_root: Path
+    job_template: Path
     callers_file: Path
     oauth_token_file: Path
     oauth_token_created: date
@@ -45,6 +46,8 @@ class Config:
     claude_bin: str
     llmenv_bin: str
     git_bin: str
+    kubectl_bin: str
+    k8s_namespace: str
     clone_url_template: str
 
 
@@ -77,6 +80,12 @@ class _Section:
             raise ConfigError(
                 f"config: {self._name}.{key} must be a date without a time, like 2026-10-12"
             )
+        return value
+
+    def text(self, key: str) -> str:
+        value = self.get(key, str)
+        if not value.strip():
+            raise ConfigError(f"config: {self._name}.{key} must not be empty")
         return value
 
     def positive(self, key: str) -> int:
@@ -136,7 +145,7 @@ def _read(path: Path) -> dict[str, Any]:
 def load_config(path: Path) -> Config:
     """Load ``path`` and return a checked Config, or raise ConfigError naming the bad key."""
     data = _read(path)
-    server, paths, auth, limits, llmenv, bins, git = (_Section(data, n) for n in _SECTIONS)
+    server, paths, auth, limits, llmenv, k8s, bins, git = (_Section(data, n) for n in _SECTIONS)
     return Config(
         listen_host=server.get("listen_host", str),
         listen_port=server.port("listen_port"),
@@ -144,6 +153,7 @@ def load_config(path: Path) -> Config:
         allowed_hosts=server.strings("allowed_hosts"),
         workspace_root=paths.path("workspace_root"),
         state_root=paths.path("state_root"),
+        job_template=paths.path("job_template"),
         callers_file=paths.path("callers_file"),
         oauth_token_file=paths.path("oauth_token_file"),
         oauth_token_created=auth.day("oauth_token_created"),
@@ -165,5 +175,7 @@ def load_config(path: Path) -> Config:
         claude_bin=bins.get("claude", str),
         llmenv_bin=bins.get("llmenv", str),
         git_bin=bins.get("git", str),
+        kubectl_bin=bins.get("kubectl", str),
+        k8s_namespace=k8s.text("namespace"),
         clone_url_template=git.clone_template("clone_url_template"),
     )

@@ -98,6 +98,7 @@ def config(tmp_path: Path, fake_claude: Path, fake_llmenv: Path) -> Config:
         allowed_hosts=("127.0.0.1:*",),
         workspace_root=tmp_path / "work",
         state_root=tmp_path / "state",
+        job_template=Path(__file__).parent.parent / "deploy" / "k8s" / "job-pod.json",
         callers_file=write_secret(secrets_dir / "callers.toml", callers),
         oauth_token_file=write_secret(secrets_dir / "oauth", "sk-ant-oat01-test\n"),
         oauth_token_created=date.today(),
@@ -119,5 +120,7 @@ def config(tmp_path: Path, fake_claude: Path, fake_llmenv: Path) -> Config:
         claude_bin=str(fake_claude),
         llmenv_bin=str(fake_llmenv),
         git_bin="git",
+        kubectl_bin="kubectl",
+        k8s_namespace="phaedrus",
         clone_url_template=f"file://{tmp_path}/origin/{{owner}}/{{name}}",
     )

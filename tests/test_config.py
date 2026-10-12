@@ -9,6 +9,7 @@ from hypothesis import strategies as st
 from robo_worker.config import ConfigError, check_clone_template, load_config
 
 EXAMPLE = Path(__file__).parent.parent / "config.example.toml"
+DEPLOYED = Path(__file__).parent.parent / "deploy" / "k8s" / "config.toml"
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -26,15 +27,25 @@ def _example_with(tmp_path: Path, old: str, new: str) -> Path:
 def test_example_config_loads() -> None:
     cfg = load_config(EXAMPLE)
     assert cfg.listen_port == 8765
-    assert cfg.public_url == "http://192.168.1.20:8765"
+    assert cfg.public_url == "http://robo-worker.phaedrus.svc:8765"
     assert cfg.oauth_token_created == date(2026, 10, 12)
     assert cfg.deny_output_styles == ("ben",)
-    assert cfg.workspace_root == Path("/home/robo-worker/work")
+    assert cfg.workspace_root == Path("/work")
+    assert cfg.job_template == Path("/etc/robo-worker/job-pod.json")
+    assert cfg.kubectl_bin == "kubectl"
+    assert cfg.k8s_namespace == "phaedrus"
+
+
+def test_deployed_config_loads() -> None:
+    # The deployed config and the example must keep the same keys.
+    cfg = load_config(DEPLOYED)
+    assert cfg.k8s_namespace == "phaedrus"
+    assert cfg.workspace_root == Path("/work")
 
 
 def test_public_url_trailing_slash_is_removed(tmp_path: Path) -> None:
     path = _example_with(tmp_path, ':8765"\n# Host', ':8765/"\n# Host')
-    assert load_config(path).public_url == "http://192.168.1.20:8765"
+    assert load_config(path).public_url == "http://robo-worker.phaedrus.svc:8765"
 
 
 @pytest.mark.parametrize(
@@ -47,7 +58,11 @@ def test_public_url_trailing_slash_is_removed(tmp_path: Path) -> None:
         ("max_job_seconds = 14400", 'max_job_seconds = "1"', "must be int"),
         ("max_job_seconds = 14400", "max_job_seconds = true", "must be int"),
         ("listen_port = 8765", "listen_port = 70000", "between 1 and 65535"),
-        ('"/home/robo-worker/work"', '"work"', "absolute path"),
+        ('"/work"', '"work"', "absolute path"),
+        ('"/etc/robo-worker/job-pod.json"', '"job-pod.json"', "absolute path"),
+        ('namespace = "phaedrus"', 'namespace = ""', "k8s.namespace must not be empty"),
+        ("[k8s]", "[k8z]", "missing [k8s] table"),
+        ('kubectl = "kubectl"\n', "", "missing bins.kubectl"),
         ("deny_tags = []", 'deny_tags = [""]', "non-empty strings"),
         ("{owner}/{name}.git", "{owner}.git", "must contain"),
         ("{owner}/{name}.git", "{owner}/{name}/{x}.git", "only {owner} and {name}"),

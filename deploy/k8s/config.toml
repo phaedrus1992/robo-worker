@@ -1,0 +1,69 @@
+# robo-worker config for the phaedrus namespace. Keep its keys equal to config.example.toml.
+
+[server]
+# The address to bind inside the pod. The pod IP is not known in advance.
+listen_host = "0.0.0.0"
+listen_port = 8765
+# The job pod's Claude session calls report_progress at this URL, through in-cluster DNS.
+public_url = "http://robo-worker.phaedrus.svc:8765"
+# Host header values the MCP transport accepts (DNS rebinding protection): the in-cluster
+# name for job pods, and the NodePort address for callers on the LAN.
+allowed_hosts = ["robo-worker.phaedrus.svc:8765", "192.168.211.10:30875"]
+
+[paths]
+# Both of these are claim mounts, shared by the control plane and by every job pod.
+workspace_root = "/work"
+state_root = "/state"
+# The job pod template, from the ConfigMap that kustomize generates. See deploy/k8s/job-pod.json.
+job_template = "/etc/robo-worker/job-pod.json"
+# Mounted from the robo-worker-secrets Secret. TOML file, no access for others: [callers] with one
+# `name = "token"` line per caller.
+callers_file = "/etc/robo-worker/secrets/callers.toml"
+# Output of `claude setup-token`, from the same Secret. The launcher copies it to each job pod.
+oauth_token_file = "/etc/robo-worker/secrets/claude-oauth-token"
+
+[auth]
+# The date of the `claude setup-token` run. The token is valid for one year.
+oauth_token_created = 2026-10-12
+token_warn_days = 30
+# Values of apiKeySource in the stream init event that bill the plan.
+allowed_key_sources = ["none"]
+
+[limits]
+# Concurrent job pods, not threads.
+max_parallel_jobs = 2
+max_parallel_asks = 2
+# The job pod's activeDeadlineSeconds is the same value, so both clocks agree.
+max_job_seconds = 14400
+max_ask_seconds = 300
+# Limit for each git and llmenv command that prepares a job.
+max_prepare_seconds = 600
+kill_grace_seconds = 30
+max_interruptions = 3
+rate_limit_retry_seconds = 900
+
+[llmenv]
+# Tags added through LLMENV_EXTRA_TAGS when a job names none.
+default_tags = []
+# deny_tags and deny_bundles are denylists: a tag or bundle that is not listed is allowed.
+# List each tag or bundle that a worker must never get, such as one that sets an output style.
+deny_tags = []
+# Bundle names that must never appear in LLMENV_ACTIVE_BUNDLES for a worker.
+deny_bundles = []
+# Output styles that stop a job when the init event reports them.
+deny_output_styles = ["ben"]
+# Names copied from the service environment into the worker environment.
+extra_env = ["GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "DISABLE_AUTOUPDATER"]
+
+[k8s]
+# The namespace the control plane creates Job objects in. It already exists.
+namespace = "phaedrus"
+
+[bins]
+claude = "claude"
+llmenv = "llmenv"
+git = "git"
+kubectl = "kubectl"
+
+[git]
+clone_url_template = "https://github.com/{owner}/{name}.git"

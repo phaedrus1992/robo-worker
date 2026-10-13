@@ -7,8 +7,9 @@
 # The manifests in <git-ref> name the image tag. --force deploys even when a job Job is
 # active, or when the active jobs cannot be counted.
 #
-# Exit codes: 0 deployed, 2 usage, 3 rolled back, 4 rollback failed or nothing to roll back
-# to, 5 refused (jobs active or count unknown), 6 cannot fetch or check out (nothing changed).
+# Exit codes: 0 deployed, 2 usage, 3 rolled back and healthy, 4 rollback failed or unhealthy
+# or nothing to roll back to, 5 refused (jobs active or count unknown), 6 nothing changed
+# (cannot fetch, check out, or read the Deployment).
 set -euo pipefail
 
 APP_DIR="${ROBO_WORKER_APP_DIR:-$HOME/git/robo-worker}"
@@ -22,7 +23,7 @@ HEALTH_URL="/api/v1/namespaces/$NAMESPACE/services/robo-worker:8765/proxy/health
 REVISION_KEY="deployment.kubernetes.io/revision"
 
 usage() {
-  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -57,10 +58,12 @@ checkout_ref() {
 }
 
 healthy() {
-  local i body=""
+  local i body="" err
+  err="$(mktemp)"
   for ((i = 0; i < HEALTH_TRIES; i++)); do
-    if body="$(kc get --raw "$HEALTH_URL" 2>/dev/null)" &&
+    if body="$(kc get --raw "$HEALTH_URL" 2>"$err")" &&
       jq -e '.ok == true' <<<"$body" >/dev/null; then
+      rm -f "$err"
       return 0
     fi
     # The new pod needs a few seconds to bind its port, and sends no signal.
@@ -68,6 +71,10 @@ healthy() {
   done
   echo "deploy: /health of the robo-worker Service is not ok." >&2
   jq -r '.problems[]? | "deploy:   problem: \(.)"' <<<"$body" >&2 2>/dev/null || true
+  if [[ -s "$err" ]]; then
+    echo "deploy:   kubectl: $(tail -n 1 "$err")" >&2
+  fi
+  rm -f "$err"
   return 1
 }
 
@@ -86,11 +93,14 @@ roll_back() {
   now="$(current_revision)" || return 1
   if [[ "$now" == "$old" ]]; then
     # The Deployment did not change. An undo here would go back one more revision.
-    echo "deploy: the Deployment is still at revision $old." >&2
-    return 0
+    echo "deploy: the Deployment is still at revision $old, so it needs no undo." >&2
+  else
+    kc rollout undo "$DEPLOYMENT" --to-revision="$old" >/dev/null &&
+      kc rollout status "$DEPLOYMENT" --timeout=300s >/dev/null || return 1
   fi
-  kc rollout undo "$DEPLOYMENT" --to-revision="$old" >/dev/null &&
-    kc rollout status "$DEPLOYMENT" --timeout=300s >/dev/null
+  # An undo reverts the Deployment only. The other objects from the ref stay applied.
+  echo "deploy: other objects from the ref (Role, Service, claims, ConfigMap) stay applied." >&2
+  healthy
 }
 
 refuse_if_busy() {
@@ -101,6 +111,7 @@ refuse_if_busy() {
         "Fix kubectl access, or use --force." >&2
       exit 5
     fi
+    echo "deploy: warning: cannot count the active jobs, and --force deploys anyway." >&2
     return 0
   fi
   if [[ "$running" != "0" && "$force" -eq 0 ]]; then
@@ -138,9 +149,11 @@ main() {
   fi
   echo "deploy: $ref failed. Rolling back." >&2
   if roll_back "$old"; then
+    echo "deploy: rolled back to revision $old, and it is healthy." >&2
     exit 3
   fi
-  echo "deploy: the rollback failed. The cluster needs a manual fix." >&2
+  echo "deploy: the rollback failed, or the old revision is not healthy." \
+    "The cluster needs a manual fix." >&2
   exit 4
 }
 

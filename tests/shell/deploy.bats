@@ -16,7 +16,16 @@ echo "kubectl $*" >>"$LOG"
 shift 2 # -n <namespace>
 case "$1 $2" in
 "get --raw")
-  if [[ "${HEALTH_OK:-true}" == "true" ]]; then echo '{"ok":true}'; else
+  if [[ -n "${HEALTH_FORBIDDEN:-}" ]]; then
+    echo 'Error from server (Forbidden): services "robo-worker" is forbidden' >&2
+    exit 1
+  fi
+  ok="${HEALTH_OK:-true}"
+  # After an undo, HEALTH_AFTER_UNDO decides the answer.
+  if [[ "$(cat "$REV_FILE")" == "5" && -n "${HEALTH_AFTER_UNDO:-}" ]]; then
+    ok="$HEALTH_AFTER_UNDO"
+  fi
+  if [[ "$ok" == "true" ]]; then echo '{"ok":true}'; else
     echo '{"ok":false,"problems":["token expired"]}'
   fi
   ;;
@@ -114,7 +123,7 @@ EOF
 }
 
 @test "rolls back to the old revision when the service is not healthy" {
-  HEALTH_OK=false run scripts/deploy.sh "$REF"
+  HEALTH_OK=false HEALTH_AFTER_UNDO=true run scripts/deploy.sh "$REF"
   [ "$status" -eq 3 ]
   grep -q "rollout undo deployment/robo-worker --to-revision=3" "$LOG"
   [[ "$output" == *"problem: token expired"* ]]
@@ -123,6 +132,7 @@ EOF
 @test "an apply that fails before the Deployment changes undoes nothing" {
   APPLY_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 3 ]
+  [[ "$output" == *"stay applied"* ]]
   run ! grep -q "rollout undo" "$LOG"
   [[ "$output" == *"still at revision 3"* ]]
 }
@@ -150,4 +160,22 @@ EOF
   GET_DEPLOY_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 6 ]
   run ! grep -q "apply" "$LOG"
+}
+
+@test "exit 4 when the old revision is not healthy after the undo" {
+  HEALTH_OK=false HEALTH_AFTER_UNDO=false run scripts/deploy.sh "$REF"
+  [ "$status" -eq 4 ]
+  grep -q "rollout undo deployment/robo-worker --to-revision=3" "$LOG"
+}
+
+@test "a failed health check prints the kubectl error" {
+  HEALTH_FORBIDDEN=1 run scripts/deploy.sh "$REF"
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"kubectl: Error from server (Forbidden)"* ]]
+}
+
+@test "--force warns when it cannot count the active jobs" {
+  JOBS_EXIT=1 run scripts/deploy.sh --force "$REF"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: cannot count the active jobs"* ]]
 }

@@ -1,4 +1,5 @@
 import re
+import tomllib
 from datetime import date
 from pathlib import Path
 
@@ -104,3 +105,13 @@ def test_clone_template_returns_or_raises_config_error(template: str) -> None:
     except ConfigError:
         return
     assert checked.format(owner="o", name="n")
+
+
+def _keys(path: Path) -> set[str]:
+    data = tomllib.loads(path.read_text())
+    return {f"{section}.{key}" for section, table in data.items() for key in table}
+
+
+def test_deployed_config_has_the_same_keys_as_the_example() -> None:
+    # kustomize reads files only from deploy/k8s, so the deployed config is a copy.
+    assert _keys(DEPLOYED) == _keys(EXAMPLE)

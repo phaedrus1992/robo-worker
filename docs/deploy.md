@@ -76,7 +76,8 @@ When either fails, it undoes the rollout to the revision that ran before.
 It refuses to deploy while a job `Job` is active, or when it cannot count them, unless you pass `--force`.
 A rollout does not stop a job pod: the new control plane attaches to each running job.
 
-Exit codes: 0 deployed, 2 usage, 3 rolled back, 4 rollback failed or nothing to roll back to, 5 refused, 6 nothing changed (cannot fetch, check out, or read the Deployment).
+Exit codes: 0 deployed, 2 usage, 3 rolled back and healthy, 4 rollback failed or unhealthy or nothing to roll back to, 5 refused, 6 nothing changed (cannot fetch, check out, or read the Deployment).
+An undo reverts the `Deployment` only. The other objects from the ref stay applied.
 
 The manifests in the ref name the image tag.
 A release commit sets `images.newTag` in `deploy/k8s/kustomization.yaml` to the version.

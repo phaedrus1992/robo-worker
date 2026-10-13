@@ -133,8 +133,9 @@ EOF
   APPLY_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 3 ]
   [[ "$output" == *"stay applied"* ]]
-  run ! grep -q "rollout undo" "$LOG"
   [[ "$output" == *"still at revision 3"* ]]
+  # run replaces $output, so the checks of the script's output come first.
+  run ! grep -q "rollout undo" "$LOG"
 }
 
 @test "exit 4 when the rollback fails too" {

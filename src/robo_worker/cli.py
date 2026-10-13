@@ -17,7 +17,7 @@ import uvicorn
 from robo_worker.asker import Asker
 from robo_worker.config import Config, ConfigError, load_config
 from robo_worker.job_main import job_main
-from robo_worker.launcher import K8sLauncher
+from robo_worker.launcher import K8sLauncher, LauncherError
 from robo_worker.scheduler import Scheduler
 from robo_worker.secret_files import SecretError, load_callers
 from robo_worker.server import build_app
@@ -33,7 +33,10 @@ async def serve(cfg: Config, callers: Mapping[str, str]) -> None:
         # HOME is on the state claim in the cluster, and a new claim is empty.
         Path(home).mkdir(parents=True, exist_ok=True)
     store = JobStore(cfg.state_root)
-    scheduler = Scheduler(cfg, store, launch=K8sLauncher(cfg, cfg.job_template))
+    launcher = K8sLauncher(cfg, cfg.job_template)
+    # A launcher that cannot start pods would fail every queued job, one at a time.
+    await launcher.check()
+    scheduler = Scheduler(cfg, store, launch=launcher)
     scheduler.recover()
     asker = Asker(cfg, store, scheduler.pauses)
     app = build_app(cfg, scheduler, asker, callers)
@@ -44,6 +47,12 @@ async def serve(cfg: Config, callers: Mapping[str, str]) -> None:
         tg.start_soon(scheduler.run_forever)
         await server.serve()
         tg.cancel_scope.cancel()
+
+
+def _attempt(text: str) -> int:
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"must be a whole number of 1 or more, got {text!r}")
+    return int(text)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -57,6 +66,9 @@ def _parser() -> argparse.ArgumentParser:
     job = sub.add_parser("job", help="run one job in this pod, then exit")
     job.add_argument("--config", type=Path, required=True, help=_CONFIG_HELP)
     job.add_argument("--job-id", required=True, help="the job to run, as submit_job returned it")
+    job.add_argument(
+        "--attempt", type=_attempt, required=True, help="the attempt number, 1 or more"
+    )
     return parser
 
 
@@ -69,11 +81,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"robo-worker: {exc}", file=sys.stderr)
         return 2
     if args.command == "job":
-        return job_main(cfg, args.job_id)
+        return job_main(cfg, args.job_id, args.attempt)
     try:
         callers = load_callers(cfg.callers_file)
     except SecretError as exc:
         print(f"robo-worker: {exc}", file=sys.stderr)
         return 2
-    anyio.run(serve, cfg, callers)
+    try:
+        anyio.run(serve, cfg, callers)
+    except LauncherError as exc:
+        print(f"robo-worker: cannot start job pods: {exc}", file=sys.stderr)
+        return 2
     return 0

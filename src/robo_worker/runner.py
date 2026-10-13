@@ -46,9 +46,19 @@ blocked_reason.
 End with a result that matches the JSON schema. Put PR and issue URLs in pr_url and issues_filed.
 """
 
-# "interrupted" comes from the launcher, never from run_claude: the job pod died without a result.
+# run_claude never returns the last three kinds. "interrupted": the job pod stopped without a
+# result. "prepare_failed" and "checkout_paused": the job pod stopped before claude started.
 type OutcomeKind = Literal[
-    "done", "blocked", "failed", "rate_limited", "auth", "timeout", "cancelled", "interrupted"
+    "done",
+    "blocked",
+    "failed",
+    "rate_limited",
+    "auth",
+    "timeout",
+    "cancelled",
+    "interrupted",
+    "prepare_failed",
+    "checkout_paused",
 ]
 type EventSink = Callable[[str, dict[str, Any]], None]
 type StopReason = Literal["exited", "timeout", "cancelled"]
@@ -95,6 +105,8 @@ class RunOutcome:
     result: dict[str, Any] | None = None
     usage: dict[str, Any] | None = None
     resets_at: float | None = None
+    # Set by the job pod when the checkout is dirty, or cannot be read, after claude stopped.
+    checkout_problem: str | None = None
 
 
 @dataclass

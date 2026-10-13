@@ -2,142 +2,172 @@ import base64
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import get_args
 
 import anyio
 import pytest
-from hypothesis import given
-from hypothesis import strategies as st
 
+from robo_worker import launcher as launcher_module
+from robo_worker.attempt import AttemptSpec, PodPaths, spec_from_json
 from robo_worker.config import Config
 from robo_worker.launcher import (
     JOB_TTL_SECONDS,
     POD_DEADLINE_MARGIN_SECONDS,
     K8sLauncher,
     LauncherError,
-    outcome_from_json,
-    outcome_to_json,
 )
-from robo_worker.runner import OutcomeKind, RunOutcome, RunSettings, RunSpec
-from robo_worker.store import JobStore
 from tests.conftest import FakeKubectl
 
 pytestmark = pytest.mark.anyio
 
 JOB_ID = "a" * 32
 NAME = f"robo-worker-{JOB_ID}-2"
+TOKEN = "sk-ant-oat01-secret"
 DONE = {
     "kind": "done",
     "reason": "ok",
     "result": {"status": "done"},
     "usage": None,
     "resets_at": None,
+    "checkout_problem": None,
 }
+SPEC = AttemptSpec(
+    job_id=JOB_ID,
+    attempt=2,
+    repo="o/r",
+    tags=["lang-python"],
+    prompt="do it",
+    session_id="b" * 36,
+    resume=True,
+)
 
 
 @pytest.fixture(autouse=True)
-def job_dir(config: Config) -> Path:
-    # The scheduler creates the job, and so its directory, before any launch.
-    path = JobStore(config.state_root).job_dir(JOB_ID)
-    path.mkdir(parents=True)
-    return path
+def pod_dir(config: Config) -> Path:
+    # The scheduler stages the pod directory before any launch.
+    paths = PodPaths.for_job(config.state_root, JOB_ID)
+    paths.root.mkdir(parents=True)
+    return paths.root
 
 
-def _spec(cfg: Config, tmp_path: Path) -> RunSpec:
-    return RunSpec(
-        job_id=JOB_ID,
-        cwd=cfg.workspace_root / "o" / "r",
-        env={"HOME": "/state/home", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"},
-        prompt="do it",
-        session_id="b" * 36,
-        resume=False,
-        mcp_config_path=tmp_path / "mcp.json",
-        stream_path=tmp_path / "stream.jsonl",
-        stderr_path=tmp_path / "stderr.log",
-        attempt=2,
-    )
+def _launcher(config: Config, template: Path | None = None) -> K8sLauncher:
+    return K8sLauncher(config, template or config.job_template, poll_seconds=0)
 
 
-def _launcher(config: Config) -> K8sLauncher:
-    return K8sLauncher(config, config.job_template, poll_seconds=0)
+async def _launch(config: Config, cancel: anyio.Event | None = None) -> launcher_module.RunOutcome:
+    return await _launcher(config)(SPEC, TOKEN, cancel=cancel or anyio.Event())
 
 
-async def test_launcher_creates_the_job_then_an_owned_env_secret(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
+async def test_launcher_creates_the_job_then_an_owned_token_secret(
+    config: Config, fake_kubectl: FakeKubectl
 ) -> None:
-    store = JobStore(config.state_root)
     fake_kubectl.complete_job(outcome=DONE)
 
-    outcome = await _launcher(config)(
-        _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-    )
+    outcome = await _launch(config)
 
     assert outcome.kind == "done"
-    assert outcome.result == {"status": "done"}
     assert all(argv[:1] == ["create"] for argv in fake_kubectl.writes())  # never apply
     job, secret = fake_kubectl.created()
-    assert job["kind"] == "Job"
     assert job["metadata"]["name"] == NAME
     assert job["metadata"]["labels"]["robo-worker/job-id"] == JOB_ID
     assert job["metadata"]["labels"]["robo-worker/attempt"] == "2"
     pod = job["spec"]["template"]
-    assert pod["metadata"]["labels"]["robo-worker/job-id"] == JOB_ID
+    assert pod["metadata"]["labels"]["robo-worker/attempt"] == "2"
     container = pod["spec"]["containers"][0]
+    # The digest of the control plane's own image, not its moving tag.
     assert container["image"] == fake_kubectl.own_image
-    assert container["args"][-2:] == ["--job-id", JOB_ID]
-    assert "envFrom" not in container
+    assert container["args"][-4:] == ["--job-id", JOB_ID, "--attempt", "2"]
     volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
-    assert volumes["env"]["secret"]["secretName"] == f"robo-worker-env-{JOB_ID}-2"
-    # The ConfigMap name carries the kustomize hash, so it comes from the launcher's own pod.
+    assert volumes["token"]["secret"]["secretName"] == f"robo-worker-token-{JOB_ID}-2"
     assert volumes["config"]["configMap"]["name"] == "robo-worker-config-h4sh"
     expected = config.max_job_seconds + config.kill_grace_seconds + POD_DEADLINE_MARGIN_SECONDS
     assert job["spec"]["activeDeadlineSeconds"] == expected
     assert job["spec"]["ttlSecondsAfterFinished"] == JOB_TTL_SECONDS
-    assert job["spec"]["backoffLimit"] == 0
+    assert pod["spec"]["terminationGracePeriodSeconds"] == 2 * config.kill_grace_seconds + 15
 
     assert secret["kind"] == "Secret"
-    assert secret["metadata"]["name"] == f"robo-worker-env-{JOB_ID}-2"
+    assert secret["metadata"]["name"] == f"robo-worker-token-{JOB_ID}-2"
     decoded = {k: base64.b64decode(v).decode() for k, v in secret["data"].items()}
-    assert decoded == _spec(config, tmp_path).env
+    assert decoded == {"claude-oauth-token": TOKEN}
     owner = secret["metadata"]["ownerReferences"][0]
     assert (owner["kind"], owner["name"], owner["uid"]) == ("Job", NAME, fake_kubectl.uid)
     assert owner["blockOwnerDeletion"] is False
 
-    written = json.loads((store.job_dir(JOB_ID) / "run_spec.json").read_text())
-    assert written["prompt"] == "do it"
-    assert written["attempt"] == 2
-    assert written["cwd"] == str(config.workspace_root / "o" / "r")
-    assert "env" not in written  # the env holds the plan token, and the claim is NFS
+    paths = PodPaths.for_job(config.state_root, JOB_ID)
+    assert spec_from_json(paths.spec.read_text()) == SPEC
+    assert TOKEN not in paths.spec.read_text()
 
 
-async def test_an_old_outcome_never_answers_for_a_new_attempt(
+async def test_a_job_pod_mounts_only_its_own_pod_dir_and_checkout(
+    config: Config, fake_kubectl: FakeKubectl
+) -> None:
+    fake_kubectl.complete_job(outcome=DONE)
+
+    await _launch(config)
+
+    job, _ = fake_kubectl.created()
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    paths = PodPaths.for_job(config.state_root, JOB_ID)
+    assert mounts["state"]["subPath"] == f"jobs/{JOB_ID}/pod"
+    assert mounts["state"]["mountPath"] == str(paths.root)
+    assert mounts["work"]["subPath"] == "o/r"
+    assert mounts["work"]["mountPath"] == str(config.workspace_root / "o" / "r")
+    assert {"name": "HOME", "value": str(paths.home)} in container["env"]
+
+
+async def test_the_no_retry_fields_are_forced(
     config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
 ) -> None:
-    store = JobStore(config.state_root)
-    (store.job_dir(JOB_ID) / "outcome.json").write_text(json.dumps(DONE))
+    template = json.loads(config.job_template.read_text())
+    template["spec"]["backoffLimit"] = 3
+    template["spec"]["template"]["spec"]["restartPolicy"] = "OnFailure"
+    edited = tmp_path / "edited.json"
+    edited.write_text(json.dumps(template))
+    fake_kubectl.complete_job(outcome=DONE)
+
+    await _launcher(config, edited)(SPEC, TOKEN, cancel=anyio.Event())
+
+    job, _ = fake_kubectl.created()
+    assert job["spec"]["backoffLimit"] == 0
+    assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+
+
+async def test_an_old_attempts_outcome_never_answers_for_a_new_one(
+    config: Config, fake_kubectl: FakeKubectl
+) -> None:
+    paths = PodPaths.for_job(config.state_root, JOB_ID)
+    paths.outcome(1).write_text(json.dumps(DONE))
     fake_kubectl.fail_job("BackoffLimitExceeded")
 
-    outcome = await _launcher(config)(
-        _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-    )
+    outcome = await _launch(config)
 
     assert outcome.kind == "interrupted"
+    assert "BackoffLimitExceeded" in outcome.reason
 
 
-async def test_attach_returns_none_when_the_job_is_gone(
+async def test_attach_returns_none_when_no_job_and_no_outcome_exist(
     config: Config, fake_kubectl: FakeKubectl
 ) -> None:
     fake_kubectl.no_job()
 
-    outcome = await _launcher(config).attach(JOB_ID, 2, cancel=anyio.Event())
-
-    assert outcome is None
+    assert await _launcher(config).attach(JOB_ID, 2, cancel=anyio.Event()) is None
     assert fake_kubectl.writes() == []
 
 
-async def test_attach_reads_the_outcome_of_a_running_job(
+async def test_attach_reads_the_outcome_of_a_job_gone_after_its_ttl(
     config: Config, fake_kubectl: FakeKubectl
 ) -> None:
+    # The pod finished while the control plane was down, and the TTL removed the Job.
+    PodPaths.for_job(config.state_root, JOB_ID).outcome(2).write_text(json.dumps(DONE))
+    fake_kubectl.no_job()
+
+    outcome = await _launcher(config).attach(JOB_ID, 2, cancel=anyio.Event())
+
+    assert outcome is not None
+    assert outcome.kind == "done"
+
+
+async def test_attach_waits_for_a_running_job(config: Config, fake_kubectl: FakeKubectl) -> None:
     fake_kubectl.complete_job(outcome=DONE)
 
     outcome = await _launcher(config).attach(JOB_ID, 2, cancel=anyio.Event())
@@ -147,113 +177,113 @@ async def test_attach_reads_the_outcome_of_a_running_job(
     assert fake_kubectl.writes() == []
 
 
-async def test_a_pod_that_dies_without_an_outcome_is_interrupted(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
-) -> None:
-    fake_kubectl.fail_job("BackoffLimitExceeded")
-
-    outcome = await _launcher(config)(
-        _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-    )
-
-    assert outcome.kind == "interrupted"
-    assert "pod_failed" in outcome.reason
-    assert "BackoffLimitExceeded" in outcome.reason
-
-
 async def test_a_pod_past_its_deadline_is_a_timeout(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
+    config: Config, fake_kubectl: FakeKubectl
 ) -> None:
     # A retry of a timed-out task times out again, so this is not an interruption.
     fake_kubectl.fail_job("DeadlineExceeded")
 
-    outcome = await _launcher(config)(
-        _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-    )
-
-    assert outcome.kind == "timeout"
+    assert (await _launch(config)).kind == "timeout"
 
 
-async def test_cancel_deletes_the_job(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
+async def test_a_completed_pod_without_an_outcome_is_interrupted_after_the_grace(
+    config: Config, fake_kubectl: FakeKubectl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(launcher_module, "OUTCOME_GRACE_SECONDS", 0.2)
+    fake_kubectl.complete_job(outcome=None)
+
+    outcome = await _launch(config)
+
+    assert outcome.kind == "interrupted"
+    assert "recorded no outcome" in outcome.reason
+
+
+async def test_a_corrupt_outcome_names_the_problem(
+    config: Config, fake_kubectl: FakeKubectl
+) -> None:
+    fake_kubectl.complete_job(outcome='{"kind": "won"}')
+
+    outcome = await _launch(config)
+
+    assert outcome.kind == "interrupted"
+    assert "not valid" in outcome.reason
+
+
+async def test_poll_errors_do_not_end_a_job_that_may_still_run(
+    config: Config, fake_kubectl: FakeKubectl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_KUBECTL_GET_JOB_FAILS", "20")
+    fake_kubectl.complete_job(outcome=DONE)
+
+    assert (await _launch(config)).kind == "done"
+
+
+async def test_cancel_deletes_the_job_and_waits_until_it_is_gone(
+    config: Config, fake_kubectl: FakeKubectl
 ) -> None:
     fake_kubectl.hang_job()
     cancel = anyio.Event()
     cancel.set()
 
-    outcome = await _launcher(config)(
-        _spec(config, tmp_path), RunSettings.from_config(config), cancel=cancel
-    )
+    outcome = await _launch(config, cancel)
 
     assert outcome.kind == "cancelled"
     assert fake_kubectl.deleted() == [NAME]
+    verbs = fake_kubectl.verbs()
+    last_delete = max(i for i, a in enumerate(verbs) if a[:2] == ["delete", "job"])
+    assert ["get", "job", NAME, "-o", "json"] in verbs[last_delete + 1 :]
 
 
-async def test_a_missing_pod_name_names_the_downward_api_entry(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl, monkeypatch: pytest.MonkeyPatch
+async def test_a_failed_secret_create_deletes_the_job_and_keeps_the_error(
+    config: Config, fake_kubectl: FakeKubectl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_KUBECTL_FAIL_SECRET", "1")
+
+    with pytest.raises(LauncherError, match="Forbidden"):
+        await _launch(config)
+
+    assert fake_kubectl.deleted() == [NAME]
+
+
+async def test_check_names_the_downward_api_entry(
+    config: Config, fake_kubectl: FakeKubectl, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("POD_NAME")
 
     with pytest.raises(LauncherError, match="POD_NAME"):
-        await _launcher(config)(
-            _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-        )
-    assert fake_kubectl.writes() == []
+        await _launcher(config).check()
 
 
-async def test_a_bad_template_is_a_launcher_error(
+async def test_check_refuses_a_bad_template(
     config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
 ) -> None:
     bad = tmp_path / "bad-template.json"
     bad.write_text("{not json")
-    launcher = K8sLauncher(config, bad, poll_seconds=0)
 
     with pytest.raises(LauncherError, match="job template"):
-        await launcher(
-            _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-        )
-    assert fake_kubectl.writes() == []
+        await _launcher(config, bad).check()
+
+
+async def test_check_refuses_an_image_without_a_digest(
+    config: Config, fake_kubectl: FakeKubectl
+) -> None:
+    fake_kubectl.set_image("ghcr.io/phaedrus1992/robo-worker:main")
+
+    with pytest.raises(LauncherError, match="not a digest"):
+        await _launcher(config).check()
+
+
+async def test_kubectl_output_that_is_not_json_is_a_launcher_error(
+    config: Config, fake_kubectl: FakeKubectl
+) -> None:
+    fake_kubectl.set_image("garbage")
+
+    with pytest.raises(LauncherError, match="not JSON"):
+        await _launcher(config).check()
 
 
 async def test_a_kubectl_failure_names_the_command(
-    config: Config, tmp_path: Path, fake_kubectl: FakeKubectl
+    config: Config, fake_kubectl: FakeKubectl
 ) -> None:
-    launcher = K8sLauncher(replace(config, kubectl_bin="false"), config.job_template)
-
-    with pytest.raises(LauncherError, match="kubectl get pod"):
-        await launcher(
-            _spec(config, tmp_path), RunSettings.from_config(config), cancel=anyio.Event()
-        )
-
-
-_FLAT = st.dictionaries(st.text(max_size=5), st.integers() | st.text(max_size=5), max_size=3)
-_OUTCOMES = st.builds(
-    RunOutcome,
-    kind=st.sampled_from(get_args(OutcomeKind.__value__)),
-    reason=st.text(),
-    result=st.none() | _FLAT,
-    usage=st.none() | _FLAT,
-    resets_at=st.none() | st.floats(allow_nan=False, allow_infinity=False),
-)
-
-
-@given(_OUTCOMES)
-def test_outcome_round_trips_through_json(outcome: RunOutcome) -> None:
-    assert outcome_from_json(outcome_to_json(outcome)) == outcome
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "[]",
-        json.dumps({**DONE, "extra": 1}),
-        json.dumps({**DONE, "kind": "won"}),
-        json.dumps({**DONE, "reason": 3}),
-        json.dumps({**DONE, "result": [1]}),
-        json.dumps({**DONE, "resets_at": True}),
-        json.dumps({**DONE, "resets_at": "soon"}),
-    ],
-)
-def test_outcome_from_json_refuses_a_bad_file(text: str) -> None:
-    with pytest.raises(ValueError):
-        outcome_from_json(text)
+    with pytest.raises(LauncherError, match=r"kubectl .*get pod"):
+        await _launcher(replace(config, kubectl_bin="false")).check()

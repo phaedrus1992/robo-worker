@@ -4,15 +4,15 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from datetime import date
-from functools import partial
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
 
+from robo_worker.attempt import AttemptSpec, run_attempt
 from robo_worker.config import Config
-from robo_worker.runner import RunOutcome, RunSettings, RunSpec, run_claude
+from robo_worker.runner import RunOutcome
 from robo_worker.scheduler import Scheduler
 from robo_worker.store import JobStore
 
@@ -48,6 +48,11 @@ def isolated_home(
     """Keep the developer's ~/.claude settings out of every test."""
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LLMENV_CONFIG_DIR", raising=False)
+    # The control plane's llmenv config clone, which each job attempt gets a copy of.
+    master = home / ".config" / "llmenv"
+    master.mkdir(parents=True)
+    (master / "config.yaml").write_text("scopes: {}\n")
     return home
 
 
@@ -88,7 +93,8 @@ class FakeKubectl:
     def _set(self, **job: object) -> None:
         (self._dir / "job.json").write_text(json.dumps(job))
 
-    def complete_job(self, *, outcome: Mapping[str, object]) -> None:
+    def complete_job(self, *, outcome: Mapping[str, object] | str | None) -> None:
+        """The Job completes. outcome None writes no outcome file, a str writes that text."""
         self._set(state="complete", outcome=outcome)
 
     def fail_job(self, reason: str) -> None:
@@ -114,6 +120,13 @@ class FakeKubectl:
                 argv = argv[2:] if argv[0] == "-n" else argv[1:]
             verbs.append(argv)
         return verbs
+
+    def set_image(self, image: str) -> None:
+        (self._dir / "image").write_text(image)
+
+    def verbs(self) -> list[list[str]]:
+        """The argv of each call, from the verb on."""
+        return self._verbs()
 
     def writes(self) -> list[list[str]]:
         """The argv of each call that changes the cluster."""
@@ -199,16 +212,13 @@ def config(tmp_path: Path, fake_claude: Path, fake_llmenv: Path) -> Config:
 
 
 class LocalLauncher:
-    """The LaunchFn the tests use: run the task in this process, through the fake claude."""
+    """The LaunchFn the tests use: run the attempt in this process, as the job pod would."""
 
-    def __init__(self, store: JobStore) -> None:
-        self._store = store
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
 
-    async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
-    ) -> RunOutcome:
-        on_event = partial(self._store.append_event, spec.job_id)
-        return await run_claude(spec, settings, cancel=cancel, on_event=on_event)
+    async def __call__(self, spec: AttemptSpec, token: str, *, cancel: anyio.Event) -> RunOutcome:
+        return await run_attempt(self._cfg, spec, token, parent=dict(os.environ), cancel=cancel)
 
     async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
         # An in-process run stops with the process, so nothing survives a restart.
@@ -217,5 +227,5 @@ class LocalLauncher:
 
 def make_scheduler(config: Config, store: JobStore, **kwargs: Any) -> Scheduler:
     """A Scheduler wired to the in-process launcher, for tests."""
-    kwargs.setdefault("launch", LocalLauncher(store))
+    kwargs.setdefault("launch", LocalLauncher(config))
     return Scheduler(config, store, **kwargs)

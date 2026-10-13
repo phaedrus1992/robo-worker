@@ -27,41 +27,119 @@
           "runAsGroup": 10001,
           "fsGroup": 10001,
           "fsGroupChangePolicy": "OnRootMismatch",
-          "seccompProfile": {"type": "RuntimeDefault"}
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
         },
         "containers": [
           {
             "name": "job",
-            "args": ["job", "--config", "/etc/robo-worker/config/config.toml"],
-            "env": [{"name": "HOME", "value": "/state/home"}],
+            "args": [
+              "job",
+              "--config",
+              "/etc/robo-worker/config/config.toml"
+            ],
             "resources": {
-              "requests": {"cpu": "500m", "memory": "1Gi"},
-              "limits": {"cpu": "2", "memory": "4Gi"}
+              "requests": {
+                "cpu": "500m",
+                "memory": "1Gi"
+              },
+              "limits": {
+                "cpu": "2",
+                "memory": "4Gi"
+              }
             },
             "securityContext": {
               "allowPrivilegeEscalation": false,
               "readOnlyRootFilesystem": true,
-              "capabilities": {"drop": ["ALL"]}
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
             },
             "volumeMounts": [
-              {"name": "work", "mountPath": "/work"},
-              {"name": "state", "mountPath": "/state"},
-              {"name": "config", "mountPath": "/etc/robo-worker/config", "readOnly": true},
-              {"name": "gh", "mountPath": "/etc/robo-worker/gh", "readOnly": true},
-              {"name": "git", "mountPath": "/etc/robo-worker/git", "readOnly": true},
-              {"name": "env", "mountPath": "/run/robo-worker/env", "readOnly": true},
-              {"name": "tmp", "mountPath": "/tmp"}
+              {
+                "name": "state",
+                "mountPath": "/state",
+                "subPath": "set-by-the-launcher"
+              },
+              {
+                "name": "work",
+                "mountPath": "/work",
+                "subPath": "set-by-the-launcher"
+              },
+              {
+                "name": "config",
+                "mountPath": "/etc/robo-worker/config",
+                "readOnly": true
+              },
+              {
+                "name": "gh",
+                "mountPath": "/etc/robo-worker/gh",
+                "readOnly": true
+              },
+              {
+                "name": "git",
+                "mountPath": "/etc/robo-worker/git",
+                "readOnly": true
+              },
+              {
+                "name": "token",
+                "mountPath": "/run/robo-worker/token",
+                "readOnly": true
+              },
+              {
+                "name": "tmp",
+                "mountPath": "/tmp"
+              }
             ]
           }
         ],
         "volumes": [
-          {"name": "work", "persistentVolumeClaim": {"claimName": "robo-worker-work"}},
-          {"name": "state", "persistentVolumeClaim": {"claimName": "robo-worker-state"}},
-          {"name": "config", "configMap": {"name": "robo-worker-config"}},
-          {"name": "gh", "secret": {"secretName": "robo-worker-gh", "defaultMode": 288}},
-          {"name": "git", "secret": {"secretName": "robo-worker-git", "defaultMode": 288}},
-          {"name": "env", "secret": {"secretName": "robo-worker-env", "defaultMode": 288}},
-          {"name": "tmp", "emptyDir": {}}
+          {
+            "name": "work",
+            "persistentVolumeClaim": {
+              "claimName": "robo-worker-work"
+            }
+          },
+          {
+            "name": "state",
+            "persistentVolumeClaim": {
+              "claimName": "robo-worker-state"
+            }
+          },
+          {
+            "name": "config",
+            "configMap": {
+              "name": "robo-worker-config"
+            }
+          },
+          {
+            "name": "gh",
+            "secret": {
+              "secretName": "robo-worker-gh",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "git",
+            "secret": {
+              "secretName": "robo-worker-git",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "token",
+            "secret": {
+              "secretName": "set-by-the-launcher",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "tmp",
+            "emptyDir": {}
+          }
         ]
       }
     }

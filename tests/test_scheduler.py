@@ -10,12 +10,13 @@ from typing import Any
 import anyio
 import pytest
 
-from robo_worker import scheduler as scheduler_module
+from robo_worker import attempt as attempt_module
+from robo_worker.attempt import AttemptSpec, PodPaths
 from robo_worker.checkout import DirtyCheckout
 from robo_worker.config import Config
 from robo_worker.env import TagError
 from robo_worker.repos import RepoName, RepoNameError
-from robo_worker.runner import CONTINUE_PROMPT, RunOutcome, RunSettings, RunSpec
+from robo_worker.runner import CONTINUE_PROMPT, RunOutcome
 from robo_worker.scheduler import (
     MAX_DETAIL_CHARS,
     PROGRESS_TOKEN_NAME,
@@ -24,7 +25,7 @@ from robo_worker.scheduler import (
 )
 from robo_worker.states import JobState
 from robo_worker.store import Job, JobStore
-from tests.conftest import FIXTURES, make_origin, make_scheduler
+from tests.conftest import FIXTURES, LocalLauncher, make_origin, make_scheduler
 
 pytestmark = [pytest.mark.anyio, pytest.mark.usefixtures("isolated_git")]
 
@@ -110,7 +111,7 @@ async def test_job_runs_to_done(
     kinds = [e["kind"] for e in store.events(job.id, 0)[0]]
     assert kinds[0] == "submitted"
     assert {"started", "rate_limit", "finished"} <= set(kinds)
-    mcp = store.job_dir(job.id) / "mcp.json"
+    mcp = PodPaths.for_job(config.state_root, job.id).mcp_config
     assert stat.S_IMODE(mcp.stat().st_mode) == 0o600
     server = json.loads(mcp.read_text())["mcpServers"]["robo-worker"]
     assert server["url"] == "http://127.0.0.1:8765/mcp"
@@ -213,20 +214,21 @@ async def test_a_blocked_job_holds_its_repo_and_resumes_on_its_dirty_tree(
 
 
 class DirtyingLauncher:
-    """The first launch leaves a file and dies, as a pod killed mid-task does."""
+    """The first attempt leaves a file and dies, as a pod killed mid-task does. The second
+    attempt runs the real pod work, so it must accept the tree its own session left."""
 
-    def __init__(self) -> None:
-        self.specs: list[RunSpec] = []
+    def __init__(self, config: Config) -> None:
+        self._local = LocalLauncher(config)
+        self._checkout = config.workspace_root / "o" / "r"
+        self.specs: list[AttemptSpec] = []
 
-    async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
-    ) -> RunOutcome:
+    async def __call__(self, spec: AttemptSpec, token: str, *, cancel: anyio.Event) -> RunOutcome:
         self.specs.append(spec)
         if len(self.specs) == 1:
-            (spec.cwd / "half-done.txt").write_text("wip\n")
+            await self._local(spec, token, cancel=cancel)
+            (self._checkout / "half-done.txt").write_text("wip\n")
             return RunOutcome("interrupted", "pod_failed: Evicted")
-        (spec.cwd / "half-done.txt").unlink()
-        return RunOutcome("done", "ok")
+        return await self._local(spec, token, cancel=cancel)
 
     async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
         return None
@@ -237,16 +239,18 @@ async def test_an_interrupted_job_resumes_on_its_dirty_tree(
 ) -> None:
     set_env("success.jsonl")
     make_origin(tmp_path)
-    launcher = DirtyingLauncher()
+    launcher = DirtyingLauncher(config)
     job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
     scheduler = make_scheduler(config, store, launch=launcher)
     async with running(scheduler):
         finished = await wait_state(store, job.id, JobState.DONE, JobState.FAILED)
         await anyio.sleep(0.2)
 
+    # The resume ran on the dirty tree. Only after the job ended does the leftover file pause
+    # the repo.
     assert finished.state is JobState.DONE
     assert [s.resume for s in launcher.specs] == [False, True]
-    assert "o/r" not in scheduler.pauses.repos
+    assert scheduler.pauses.repos["o/r"].startswith("checkout_dirty")
 
 
 async def test_recover_after_restart(config: Config, store: JobStore, set_env: SetEnv) -> None:
@@ -291,9 +295,7 @@ class AttachLauncher:
         self.launches = 0
         self.attached: list[tuple[str, int]] = []
 
-    async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
-    ) -> RunOutcome:
+    async def __call__(self, spec: AttemptSpec, token: str, *, cancel: anyio.Event) -> RunOutcome:
         self.launches += 1
         return self.outcome
 
@@ -307,11 +309,9 @@ class ScriptedLauncher:
 
     def __init__(self, outcomes: list[RunOutcome]) -> None:
         self._outcomes = outcomes
-        self.specs: list[RunSpec] = []
+        self.specs: list[AttemptSpec] = []
 
-    async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
-    ) -> RunOutcome:
+    async def __call__(self, spec: AttemptSpec, token: str, *, cancel: anyio.Event) -> RunOutcome:
         self.specs.append(spec)
         return self._outcomes.pop(0)
 
@@ -528,7 +528,7 @@ async def test_cancel_during_a_dirty_prepare_is_not_lost(
         await release.wait()
         raise DirtyCheckout("dirty on purpose")
 
-    monkeypatch.setattr(scheduler_module, "prepare_checkout", blocked_checkout)
+    monkeypatch.setattr(attempt_module, "prepare_checkout", blocked_checkout)
     scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
@@ -583,13 +583,16 @@ async def test_auth_pause_is_an_event(
     assert "queue_paused" in kinds
 
 
-async def test_home_settings_with_an_api_key_helper_fail_the_job(
-    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv, isolated_home: Path
+async def test_llmenv_settings_with_an_api_key_helper_fail_the_job(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
 ) -> None:
     make_origin(tmp_path)
-    (isolated_home / ".claude").mkdir()
-    (isolated_home / ".claude" / "settings.json").write_text('{"apiKeyHelper": "/bin/key"}')
-    set_env("success.jsonl")
+    claude_dir = tmp_path / "claude-config"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text('{"apiKeyHelper": "/bin/key"}')
+    export = tmp_path / "export.sh"
+    export.write_text(f"export CLAUDE_CONFIG_DIR='{claude_dir}'\n")
+    set_env("success.jsonl", FAKE_LLMENV_OUTPUT=str(export))
     scheduler = make_scheduler(config, store)
     job = scheduler.submit("o/r", "p", None, "agent")
     async with running(scheduler):
@@ -597,3 +600,115 @@ async def test_home_settings_with_an_api_key_helper_fail_the_job(
     assert failed.reason is not None
     assert "apiKeyHelper" in failed.reason
     assert records(tmp_path) == []
+
+
+async def test_a_job_gets_its_own_home_and_llmenv_config(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv, isolated_home: Path
+) -> None:
+    # Settings in the control plane's own HOME must not reach a job, and the reverse.
+    make_origin(tmp_path)
+    (isolated_home / ".claude").mkdir()
+    (isolated_home / ".claude" / "settings.json").write_text('{"apiKeyHelper": "/bin/key"}')
+    set_env("success.jsonl")
+    scheduler = make_scheduler(config, store)
+    job = scheduler.submit("o/r", "p", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, job.id, JobState.DONE)
+    paths = PodPaths.for_job(config.state_root, job.id)
+    (call,) = records(tmp_path)
+    assert "HOME" in call["env"]
+    assert (paths.llmenv_config / "config.yaml").read_text() == "scopes: {}\n"
+    assert not (paths.llmenv_config / "config.yaml").is_symlink()
+
+
+async def test_a_waiting_job_says_which_job_holds_its_repo(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    set_env("blocked.jsonl")
+    scheduler = make_scheduler(config, store)
+    first = scheduler.submit("o/r", "one", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, first.id, JobState.BLOCKED)
+        second = scheduler.submit("o/r", "two", None, "agent")
+        await anyio.sleep(0.3)
+        scheduler.kick()
+        await anyio.sleep(0.3)
+    waiting = [e for e in store.events(second.id, 0)[0] if e["kind"] == "waiting_for_owner"]
+    assert [e["data"] for e in waiting] == [{"owner_job": first.id}]
+
+
+async def test_repo_pauses_survive_a_restart(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    set_env("success.jsonl", FAKE_CLAUDE_TOUCH="scratch.txt")
+    scheduler = make_scheduler(config, store)
+    job = scheduler.submit("o/r", "one", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, job.id, JobState.DONE)
+        await anyio.sleep(0.2)
+    assert "o/r" in scheduler.pauses.repos
+
+    restarted = make_scheduler(config, store)
+    restarted.recover()
+
+    assert restarted.pauses.repos == scheduler.pauses.repos
+    restarted.resume_queue("o/r")
+    again = make_scheduler(config, store)
+    again.recover()
+    assert again.pauses.repos == {}
+
+
+async def test_a_restored_progress_token_is_revoked_when_the_job_ends(
+    config: Config, store: JobStore
+) -> None:
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    token = make_scheduler(config, store).issue_progress_token(job.id)
+    store.transition(job, JobState.RUNNING)
+    launcher = AttachLauncher(RunOutcome("done", "ok"))
+    scheduler = make_scheduler(config, store, launch=launcher)
+    scheduler.recover()
+    assert scheduler.job_for_progress_token(token) == job.id
+
+    async with running(scheduler):
+        await wait_state(store, job.id, JobState.DONE)
+        await anyio.sleep(0.1)
+
+    assert scheduler.job_for_progress_token(token) is None
+
+
+async def test_the_pod_events_land_in_the_job_events(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    set_env("success.jsonl")
+    scheduler = make_scheduler(config, store)
+    job = scheduler.submit("o/r", "do it", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, job.id, JobState.DONE)
+    kinds = [e["kind"] for e in store.events(job.id, 0)[0]]
+    # success.jsonl holds a rate_limit_event, which the pod reports as its own event.
+    assert kinds.index("rate_limit") < kinds.index("finished")
+    assert not PodPaths.for_job(config.state_root, job.id).events.exists()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state"),
+    [
+        (RunOutcome("prepare_failed", "llmenv export failed"), JobState.FAILED),
+        (RunOutcome("checkout_paused", "checkout_dirty: x"), JobState.QUEUED),
+    ],
+)
+async def test_an_attempt_that_stops_before_claude_does_not_start_the_session(
+    config: Config, store: JobStore, outcome: RunOutcome, state: JobState
+) -> None:
+    launcher = ScriptedLauncher([outcome])
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    scheduler = make_scheduler(config, store, launch=launcher)
+    async with running(scheduler):
+        final = await wait_state(store, job.id, state)
+        await anyio.sleep(0.1)
+    assert final.started is False
+    assert final.interruptions == 0
+    assert launcher.specs[0].resume is False

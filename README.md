@@ -18,9 +18,8 @@ Design: RoboPhaedrus1992/agent `docs/superpowers/specs/2026-10-11-robo-worker-de
 - A worker runs `claude -p` with `bypassPermissions` and runs the code of the repo it checks out, such as its tests.
   That code sees the plan OAuth token in its environment.
   Submit only repos that you trust.
-- Each task runs in its own job pod. A job pod does not mount the caller tokens or the plan token file, and it has no access to the k8s API.
-  A job pod still runs as the same uid as the control plane and mounts the same state claim, so a worker can change the job store and the llmenv config clone under `/state/home`.
-  Issue #1 tracks that gap.
+- Each attempt of a job runs in its own job pod. A job pod mounts only its own job directory and its own repo checkout. It does not mount the caller tokens, and it has no access to the k8s API. The control plane never runs a program on data that a job pod wrote. Details: `docs/deploy.md`, "What a job pod can reach".
+- Jobs on the same repo share its checkout, so a job can leave a git hook there for the next job on that repo.
 - `default_tags`, `deny_tags`, and `deny_bundles` are denylists.
   A tag or bundle that the llmenv config adds later is open to jobs until you deny it.
 

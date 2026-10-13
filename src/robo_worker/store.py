@@ -92,12 +92,6 @@ class JobStore:
             raise UnknownJob(job_id)
         return self._jobs / job_id
 
-    def stream_path(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "stream.jsonl"
-
-    def stderr_path(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "stderr.log"
-
     def create(self, *, repo: str, prompt: str, tags: list[str], caller: str) -> Job:
         now = self._clock()
         job = Job(

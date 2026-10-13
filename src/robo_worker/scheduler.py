@@ -14,33 +14,31 @@ from typing import Protocol
 import anyio
 from anyio.abc import TaskGroup
 
-from robo_worker.checkout import (
-    CheckoutError,
-    DirtyCheckout,
-    checkout_path,
-    is_dirty,
-    prepare_checkout,
-    sync_checkout,
+from robo_worker.attempt import (
+    AttemptSpec,
+    PodFileError,
+    PodPaths,
+    StagingError,
+    read_pod_events,
+    read_pod_text,
+    spec_from_json,
+    stage_pod_dir,
 )
+from robo_worker.checkout import checkout_path
 from robo_worker.config import Config
-from robo_worker.env import (
-    EnvError,
-    build_worker_env,
-    check_bundles,
-    check_claude_settings,
-    llmenv_export,
-    validate_tags,
-)
+from robo_worker.env import validate_tags
 from robo_worker.repos import parse_repo
-from robo_worker.runner import CONTINUE_PROMPT, RunOutcome, RunSettings, RunSpec
+from robo_worker.runner import CONTINUE_PROMPT, RunOutcome
 from robo_worker.secret_files import SecretError, read_secret, write_private
 from robo_worker.states import TERMINAL, JobState
 from robo_worker.store import Job, JobStore, StoreError, UnknownJob
 
 _log = logging.getLogger(__name__)
 
-# The progress token lives beside mcp.json, so a restart can restore the mapping.
+# The progress token lives in the job directory, so a restart can restore the mapping.
 PROGRESS_TOKEN_NAME = "progress_token"
+# The repo pauses live in state_root, so a restart keeps them.
+REPO_PAUSES_NAME = "repo_pauses.json"
 
 # Progress text lands in an event file that callers poll. Keep each event small.
 MAX_PHASE_CHARS = 64
@@ -52,9 +50,12 @@ _STATE_FOR: dict[str, JobState] = {
     "failed": JobState.FAILED,
     "timeout": JobState.FAILED,
     "auth": JobState.FAILED,
+    "prepare_failed": JobState.FAILED,
     "cancelled": JobState.CANCELLED,
     "rate_limited": JobState.RATE_LIMITED,
 }
+# Claude did not run in these attempts, so the job's session did not start or change.
+_BEFORE_CLAUDE = frozenset({"prepare_failed", "checkout_paused"})
 
 
 class SubmitError(ValueError):
@@ -62,10 +63,10 @@ class SubmitError(ValueError):
 
 
 class LaunchFn(Protocol):
-    """Run one task and report its outcome. The production one starts a k8s Job."""
+    """Run one attempt in a job pod and report its outcome. The production one is a k8s Job."""
 
     async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
+        self, spec: AttemptSpec, token: str, *, cancel: anyio.Event
     ) -> RunOutcome: ...
 
     async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
@@ -78,6 +79,14 @@ class Pauses:
     auth: str | None = None
     rate_limit_until: float | None = None
     repos: dict[str, str] = field(default_factory=dict)
+
+
+def _llmenv_master() -> Path:
+    """The control plane's own llmenv config clone. Each attempt gets a copy of it."""
+    override = os.environ.get("LLMENV_CONFIG_DIR")
+    if override:
+        return Path(override)
+    return Path(os.environ.get("HOME", "/nonexistent")) / ".config" / "llmenv"
 
 
 class Scheduler:
@@ -95,15 +104,14 @@ class Scheduler:
         self._store = store
         self._launch = launch
         self._clock = clock
-        self._parent = dict(os.environ)
-        self._settings = RunSettings.from_config(cfg)
+        self._llmenv_master = _llmenv_master()
         self.pauses = Pauses()
         self._busy: set[str] = set()
         self._cancels: dict[str, anyio.Event] = {}
         self._progress: dict[str, str] = {}
+        self._restored: dict[str, str] = {}
+        self._told_waiting: set[str] = set()
         self._wake = anyio.Event()
-        # llmenv export pulls its config repo with no lock, so exports run one at a time.
-        self._export_lock = anyio.Lock()
 
     @property
     def store(self) -> JobStore:
@@ -156,6 +164,7 @@ class Scheduler:
         slug = parse_repo(repo).slug
         if self.pauses.repos.pop(slug, None) is None:
             raise SubmitError(f"the queue for {slug} is not paused")
+        self._save_repo_pauses()
         self.kick()
 
     # Progress from the worker's own Claude session.
@@ -174,12 +183,18 @@ class Scheduler:
     def job_for_progress_token(self, token: str) -> str | None:
         return self._progress.get(token)
 
-    def _restore_progress_token(self, job_id: str) -> None:
-        path = self._store.job_dir(job_id) / PROGRESS_TOKEN_NAME
+    def _restore_progress_token(self, job: Job) -> None:
+        path = self._store.job_dir(job.id) / PROGRESS_TOKEN_NAME
         try:
-            self._progress[read_secret(path)] = job_id
+            token = read_secret(path)
         except SecretError as exc:
-            _log.warning("job %s: cannot restore its progress token: %s", job_id, exc)
+            _log.warning("job %s: cannot restore its progress token: %s", job.id, exc)
+            self._store.append_event(
+                job.id, "progress_lost", {"reason": f"cannot restore the progress token: {exc}"}
+            )
+            return
+        self._progress[token] = job.id
+        self._restored[job.id] = token
 
     def report_progress(self, job_id: str, phase: str, detail: str) -> None:
         if not phase.strip():
@@ -190,21 +205,18 @@ class Scheduler:
     # Lifecycle.
 
     def recover(self) -> None:
-        """Requeue the interrupted jobs, and restore the rate-limit pause.
+        """Restore the pauses and the progress tokens, and requeue the interrupted jobs.
 
         A `running` job stays `running`: its pod can outlive this process. `run_forever`
         attaches to it before it starts anything new.
         """
+        self.pauses.repos = self._load_repo_pauses()
         for job in self._store.all(JobState.RUNNING):
             # The job pod may still be alive. Its mcp.json holds a progress token that this
             # process never issued, so restore the mapping before anything else.
-            self._restore_progress_token(job.id)
+            self._restore_progress_token(job)
         for job in self._store.all(JobState.INTERRUPTED):
-            if job.interruptions > self._cfg.max_interruptions:
-                reason = f"interrupted {job.interruptions} times, more than max_interruptions"
-                self._store.transition(job, JobState.FAILED, reason)
-            else:
-                self._store.transition(job, JobState.QUEUED)
+            self._requeue_or_fail(job)
         resets = [j.resets_at for j in self._store.all(JobState.RATE_LIMITED) if j.resets_at]
         if resets:
             self.pauses.rate_limit_until = max(resets)
@@ -235,16 +247,27 @@ class Scheduler:
             outcome = await self._launch.attach(job_id, job.attempts, cancel=cancel)
             if outcome is None:
                 outcome = RunOutcome("interrupted", "the job pod was gone after a service restart")
-            self._finish(job, outcome)
-            path = checkout_path(self._cfg.workspace_root, parse_repo(job.repo))
-            await self._check_dirty_after(job, path)
+            self._finish(job, outcome, resumed=self._attempt_resumed(job))
         except Exception as exc:
             _log.exception("job %s failed with an internal error after a restart", job_id)
             self._settle(job_id, (JobState.RUNNING,), JobState.FAILED, f"internal error: {exc!r}")
         finally:
+            token = self._restored.pop(job_id, None)
+            if token is not None:
+                self.revoke_progress_token(token)
             self._cancels.pop(job_id, None)
             self._busy.discard(repo)
             self.kick()
+
+    def _attempt_resumed(self, job: Job) -> bool:
+        """Whether the attempt that ran used --resume, from the attempt.json it was given."""
+        path = PodPaths.for_job(self._cfg.state_root, job.id).spec
+        try:
+            return spec_from_json(read_pod_text(path)).resume
+        except (OSError, PodFileError) as exc:
+            _log.warning("job %s: cannot read attempt.json: %s", job.id, exc)
+            # Keeping started=True is the safe side: a lost session fails loudly on --resume.
+            return True
 
     def _release_rate_limit(self) -> None:
         until = self.pauses.rate_limit_until
@@ -257,8 +280,8 @@ class Scheduler:
     def _repo_owners(self) -> dict[str, str]:
         """Map each repo to the started, unfinished job that owns its checkout.
 
-        A blocked, rate-limited, or interrupted job left its session and its work in progress
-        in the checkout, and its resume expects to find both. No other job may start there.
+        A blocked, rate-limited, or requeued job left its session and its work in progress in
+        the checkout, and its resume expects to find both. No other job may start there.
         """
         owners: dict[str, str] = {}
         for state in (JobState.BLOCKED, JobState.RATE_LIMITED, JobState.QUEUED):
@@ -277,11 +300,19 @@ class Scheduler:
                 return
             if job.repo in self._busy or job.repo in self.pauses.repos:
                 continue
-            if owners.get(job.repo, job.id) != job.id:
+            owner = owners.get(job.repo, job.id)
+            if owner != job.id:
+                self._tell_waiting(job, owner)
                 continue
             self._busy.add(job.repo)
             self._cancels[job.id] = anyio.Event()
             tg.start_soon(self._run_job, job.id, job.repo)
+
+    def _tell_waiting(self, job: Job, owner: str) -> None:
+        if job.id in self._told_waiting:
+            return
+        self._told_waiting.add(job.id)
+        self._store.append_event(job.id, "waiting_for_owner", {"owner_job": owner})
 
     async def _run_job(self, job_id: str, repo: str) -> None:
         try:
@@ -298,7 +329,7 @@ class Scheduler:
         finally:
             cancel = self._cancels.pop(job_id, None)
             if cancel is not None and cancel.is_set():
-                # A cancel that arrives while _prepare runs must not be lost when it stops early.
+                # A cancel that arrives before the launch must not be lost when it stops early.
                 self._settle(
                     job_id, (JobState.QUEUED,), JobState.CANCELLED, "cancelled by a caller"
                 )
@@ -315,86 +346,56 @@ class Scheduler:
             _log.error("cannot move job %s to %s: %s", job_id, new, exc)
 
     async def _execute(self, job: Job) -> None:
-        prepared = await self._prepare(job)
-        if prepared is None:
-            return
-        cwd, env = prepared
-        outcome = await self._run_once(job, cwd, env)
-        self._finish(job, outcome)
-        await self._check_dirty_after(job, cwd)
-
-    async def _prepare(self, job: Job) -> tuple[Path, dict[str, str]] | None:
         try:
             token = read_secret(self._cfg.oauth_token_file)
         except SecretError as exc:
             self.pauses.auth = str(exc)
             _log.warning("all queues paused for auth: %s", exc)
             self._store.append_event(job.id, "queue_paused", {"reason": f"auth: {exc}"})
-            return None
-        # A resume runs on the tree its own session left, dirty or not.
-        checkout = sync_checkout if job.started else prepare_checkout
-        try:
-            cwd = await checkout(
-                self._cfg.git_bin,
-                self._cfg.workspace_root,
-                parse_repo(job.repo),
-                self._cfg.clone_url_template,
-                self._cfg.max_prepare_seconds,
-            )
-        except DirtyCheckout as exc:
-            self._pause_repo(job, f"checkout_dirty: {exc}")
-            return None
-        except CheckoutError as exc:
-            self._store.transition(job, JobState.FAILED, f"checkout failed: {exc}")
-            return None
-        try:
-            return cwd, await self._worker_env(cwd, job.tags, token)
-        except EnvError as exc:
-            self._store.transition(job, JobState.FAILED, str(exc))
-            return None
+            return
+        resumed = job.started
+        outcome = await self._run_once(job, token)
+        if outcome is not None:
+            self._finish(job, outcome, resumed=resumed)
 
-    async def _worker_env(self, cwd: Path, tags: list[str], token: str) -> dict[str, str]:
-        async with self._export_lock:
-            llmenv_vars = await llmenv_export(
-                self._cfg.llmenv_bin, cwd, tags, self._parent, self._cfg.max_prepare_seconds
-            )
-        check_bundles(llmenv_vars, self._cfg.deny_bundles)
-        check_claude_settings(llmenv_vars, self._parent.get("HOME"))
-        return build_worker_env(
-            parent=self._parent,
-            llmenv_vars=llmenv_vars,
-            oauth_token=token,
-            extra_env=self._cfg.extra_env,
-        )
-
-    async def _run_once(self, job: Job, cwd: Path, env: dict[str, str]) -> RunOutcome:
+    async def _run_once(self, job: Job, token: str) -> RunOutcome | None:
         cancel = self._cancels[job.id]
         if cancel.is_set():
             return RunOutcome("cancelled", "cancelled by a caller")
-        token = self.issue_progress_token(job.id)
+        paths = PodPaths.for_job(self._cfg.state_root, job.id)
+        try:
+            # Plain file work only: the control plane never runs a program on pod data.
+            stage_pod_dir(paths, self._llmenv_master)
+            checkout_path(self._cfg.workspace_root, parse_repo(job.repo)).mkdir(
+                parents=True, exist_ok=True
+            )
+        except (OSError, StagingError) as exc:
+            self._store.transition(job, JobState.FAILED, f"cannot stage the job pod: {exc}")
+            return None
+        progress = self.issue_progress_token(job.id)
         job.attempts += 1
         try:
-            spec = RunSpec(
+            spec = AttemptSpec(
                 job_id=job.id,
                 attempt=job.attempts,
-                cwd=cwd,
-                env=env,
+                repo=job.repo,
+                tags=list(job.tags),
                 prompt=self._prompt_for(job),
                 session_id=job.session_id,
                 resume=job.started,
-                mcp_config_path=self._write_mcp_config(job.id, token),
-                stream_path=self._store.stream_path(job.id),
-                stderr_path=self._store.stderr_path(job.id),
             )
+            self._write_mcp_config(paths, progress)
             job.started = True
             job.resume_prompt = None
             self._store.transition(job, JobState.RUNNING)
-            self._store.append_event(job.id, "started", {"resume": spec.resume})
-            # The job pod appends the run's events to the same store. This process appends
-            # nothing for this job until the outcome comes back, so each file has one writer.
-            return await self._launch(spec, self._settings, cancel=cancel)
+            self._store.append_event(
+                job.id, "started", {"resume": spec.resume, "attempt": spec.attempt}
+            )
+            # The pod writes its own files under jobs/<id>/pod. This process appends nothing
+            # for this job until the outcome comes back.
+            return await self._launch(spec, token, cancel=cancel)
         finally:
-            self.revoke_progress_token(token)
+            self.revoke_progress_token(progress)
 
     @staticmethod
     def _prompt_for(job: Job) -> str:
@@ -402,26 +403,43 @@ class Scheduler:
             return job.prompt
         return job.resume_prompt or CONTINUE_PROMPT
 
-    def _write_mcp_config(self, job_id: str, token: str) -> Path:
+    def _write_mcp_config(self, paths: PodPaths, token: str) -> None:
         server = {
             "type": "http",
             "url": f"{self._cfg.public_url}/mcp",
             "headers": {"Authorization": f"Bearer {token}"},
         }
-        path = self._store.job_dir(job_id) / "mcp.json"
-        write_private(path, json.dumps({"mcpServers": {"robo-worker": server}}))
-        return path
+        write_private(paths.mcp_config, json.dumps({"mcpServers": {"robo-worker": server}}))
 
-    def _finish(self, job: Job, outcome: RunOutcome) -> None:
+    def _finish(self, job: Job, outcome: RunOutcome, *, resumed: bool) -> None:
+        paths = PodPaths.for_job(self._cfg.state_root, job.id)
+        for kind, data in read_pod_events(paths.events):
+            self._store.append_event(job.id, kind, data)
+        paths.events.unlink(missing_ok=True)
         job.result = outcome.result
         job.usage = outcome.usage
         if outcome.usage is not None:
             record = {"time": self._clock(), "kind": "job", "job_id": job.id}
             record |= {"caller": job.caller, "repo": job.repo, **outcome.usage}
             self._store.append_usage(record)
+        if outcome.kind in _BEFORE_CLAUDE:
+            job.started = resumed
         if outcome.kind == "interrupted":
-            self._requeue_interrupted(job, outcome.reason)
-            return
+            job.interruptions += 1
+            self._store.transition(job, JobState.INTERRUPTED, outcome.reason)
+            self._requeue_or_fail(job)
+        elif outcome.kind == "checkout_paused":
+            self._pause_repo(job, outcome.reason)
+            # The pause is not the job's fault, so it does not count as an interruption.
+            self._store.transition(job, JobState.INTERRUPTED, outcome.reason)
+            self._store.transition(job, JobState.QUEUED)
+        else:
+            self._apply_ending(job, outcome)
+        self._store.append_event(
+            job.id, "finished", {"state": job.state.value, "reason": outcome.reason}
+        )
+
+    def _apply_ending(self, job: Job, outcome: RunOutcome) -> None:
         if outcome.kind == "rate_limited":
             retry_at = self._clock() + self._cfg.rate_limit_retry_seconds
             job.resets_at = outcome.resets_at or retry_at
@@ -429,38 +447,37 @@ class Scheduler:
         elif outcome.kind == "auth":
             self.pauses.auth = outcome.reason
         self._store.transition(job, _STATE_FOR[outcome.kind], outcome.reason)
-        self._store.append_event(
-            job.id, "finished", {"state": job.state.value, "reason": outcome.reason}
-        )
+        if job.state in TERMINAL and outcome.checkout_problem:
+            self._pause_repo(
+                job,
+                f"{outcome.checkout_problem}. Clean it, then call resume_queue('{job.repo}').",
+            )
 
-    def _requeue_interrupted(self, job: Job, reason: str) -> None:
-        # INTERRUPTED is a pass-through state here: the job goes on to QUEUED or FAILED at once,
-        # so "interrupted" has no entry in _STATE_FOR.
-        job.interruptions += 1
-        self._store.transition(job, JobState.INTERRUPTED, reason)
+    def _requeue_or_fail(self, job: Job) -> None:
+        """Move an interrupted job back to the queue, or fail it past max_interruptions."""
         if job.interruptions > self._cfg.max_interruptions:
             limit = f"interrupted {job.interruptions} times, more than max_interruptions"
             self._store.transition(job, JobState.FAILED, limit)
         else:
             self._store.transition(job, JobState.QUEUED)
-        self._store.append_event(job.id, "finished", {"state": job.state.value, "reason": reason})
 
     def _pause_repo(self, job: Job, reason: str) -> None:
         self.pauses.repos[job.repo] = reason
+        self._save_repo_pauses()
         self._store.append_event(job.id, "queue_paused", {"reason": reason})
 
-    async def _check_dirty_after(self, job: Job, cwd: Path) -> None:
-        if job.state not in TERMINAL:
-            # The job comes back to this tree: blocked, rate-limited, or requeued.
-            return
+    def _save_repo_pauses(self) -> None:
+        write_private(self._cfg.state_root / REPO_PAUSES_NAME, json.dumps(self.pauses.repos))
+
+    def _load_repo_pauses(self) -> dict[str, str]:
+        path = self._cfg.state_root / REPO_PAUSES_NAME
         try:
-            dirty = await is_dirty(self._cfg.git_bin, cwd, self._cfg.max_prepare_seconds)
-        except CheckoutError as exc:
-            self._pause_repo(job, f"checkout_unknown: {exc}")
-            return
-        if dirty:
-            self._pause_repo(
-                job,
-                f"checkout_dirty: {cwd} has uncommitted changes. "
-                f"Clean it, then call resume_queue('{job.repo}').",
-            )
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            _log.error("cannot read %s, so no repo starts paused: %s", path, exc)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}

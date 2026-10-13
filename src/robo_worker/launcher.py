@@ -1,4 +1,4 @@
-"""Run one job in a k8s Job pod and read the outcome back off the state claim."""
+"""Run each attempt of a job in its own k8s Job pod, and read the outcome back."""
 
 import base64
 import copy
@@ -6,37 +6,46 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import asdict, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any
 
 import anyio
 
+from robo_worker.attempt import (
+    AttemptSpec,
+    PodFileError,
+    PodPaths,
+    outcome_from_json,
+    read_pod_text,
+    spec_to_json,
+)
+from robo_worker.checkout import checkout_path
 from robo_worker.config import Config
 from robo_worker.proc_output import stderr_tail
-from robo_worker.runner import OutcomeKind, RunOutcome, RunSettings, RunSpec
+from robo_worker.repos import parse_repo
+from robo_worker.runner import RunOutcome
 from robo_worker.secret_files import write_private
-from robo_worker.store import JobStore
 
 _log = logging.getLogger(__name__)
 
-# The control plane writes the run spec, and the job pod writes the outcome. Both sit in the
-# job directory on the shared state claim.
-RUN_SPEC_NAME = "run_spec.json"
-OUTCOME_NAME = "outcome.json"
 # How often the launcher asks the API server about a job pod. A task runs for minutes.
 POD_POLL_SECONDS = 5.0
+# The longest wait between polls while the API server does not answer.
+MAX_POLL_BACKOFF_SECONDS = 60.0
 # A finished Job object stays this long, so a caller can still read its pod logs.
 JOB_TTL_SECONDS = 3600
 # Image pull and pod start count toward activeDeadlineSeconds. The runner's own clock must
 # stop claude first, so the pod records a "timeout" outcome before k8s kills it.
 POD_DEADLINE_MARGIN_SECONDS = 600
-# A short API server outage must not fail a job whose pod still runs: about one minute.
-MAX_POLL_ERRORS = 12
+# The NFS client of the control plane can cache "no such file" for up to 60 seconds, so a
+# Job that completed gets this long for its outcome file to show up.
+OUTCOME_GRACE_SECONDS = 60.0
 JOB_ID_LABEL = "robo-worker/job-id"
 ATTEMPT_LABEL = "robo-worker/attempt"
+TOKEN_KEY = "claude-oauth-token"
 _KUBECTL_TIMEOUT = "--request-timeout=30s"
-_OUTCOME_KINDS = frozenset(get_args(OutcomeKind.__value__))
+_IMAGE_ID_PREFIXES = ("docker-pullable://", "docker://")
 
 
 class LauncherError(RuntimeError):
@@ -47,91 +56,94 @@ def job_name(job_id: str, attempt: int) -> str:
     return f"robo-worker-{job_id}-{attempt}"
 
 
-def env_secret_name(job_id: str, attempt: int) -> str:
-    return f"robo-worker-env-{job_id}-{attempt}"
-
-
-def outcome_to_json(outcome: RunOutcome) -> str:
-    return json.dumps(asdict(outcome))
-
-
-def outcome_from_json(text: str) -> RunOutcome:
-    """Parse an outcome file. Raise ValueError when it is not a valid outcome."""
-    data = json.loads(text)
-    if not isinstance(data, dict) or set(data) != {f.name for f in fields(RunOutcome)}:
-        raise ValueError(f"an outcome needs exactly the keys of RunOutcome, got {data!r:.200}")
-    if data["kind"] not in _OUTCOME_KINDS or not isinstance(data["reason"], str):
-        raise ValueError(f"unknown outcome kind {data['kind']!r:.50} or bad reason")
-    for key in ("result", "usage"):
-        if data[key] is not None and not isinstance(data[key], dict):
-            raise ValueError(f"outcome {key} must be an object or null")
-    resets_at = data["resets_at"]
-    # bool is a subclass of int, so `true` must not pass as a time.
-    number = isinstance(resets_at, int | float) and not isinstance(resets_at, bool)
-    if resets_at is not None and not number:
-        raise ValueError("outcome resets_at must be a number or null")
-    return RunOutcome(**data)
+def token_secret_name(job_id: str, attempt: int) -> str:
+    return f"robo-worker-token-{job_id}-{attempt}"
 
 
 def _condition(job: dict[str, Any], kind: str) -> dict[str, Any] | None:
-    for condition in job.get("status", {}).get("conditions") or []:
-        if condition.get("type") == kind and condition.get("status") == "True":
+    status = job.get("status")
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    for condition in conditions or []:
+        if (
+            isinstance(condition, dict)
+            and condition.get("type") == kind
+            and condition.get("status") == "True"
+        ):
             return condition
     return None
 
 
+@dataclass(frozen=True)
+class OwnPod:
+    """What a job pod copies from the control-plane pod."""
+
+    image: str
+    config_volume: dict[str, Any]
+
+
 class K8sLauncher:
-    """The production LaunchFn: one `claude -p` task, one k8s Job, one pod."""
+    """The production LaunchFn: one attempt, one k8s Job, one pod."""
 
     def __init__(
         self, cfg: Config, template: Path, *, poll_seconds: float = POD_POLL_SECONDS
     ) -> None:
         self._cfg = cfg
-        self._template = template
+        self._template_path = template
         self._poll = poll_seconds
-        self._store = JobStore(cfg.state_root)
+        self._own: OwnPod | None = None
+        self._template: dict[str, Any] | None = None
 
-    async def __call__(
-        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
-    ) -> RunOutcome:
-        template = self._load_template()
-        own_pod = await self._own_pod()
+    async def check(self) -> None:
+        """Read the job template and this pod once. Raise LauncherError naming the fix."""
+        self._template = self._load_template()
+        self._own = await self._own_pod()
+
+    async def __call__(self, spec: AttemptSpec, token: str, *, cancel: anyio.Event) -> RunOutcome:
+        if self._own is None or self._template is None:
+            await self.check()
+        own, template = self._own, self._template
+        if own is None or template is None:
+            raise LauncherError("the launcher check did not set the pod and the template")
+        paths = PodPaths.for_job(self._cfg.state_root, spec.job_id)
+        write_private(paths.spec, spec_to_json(spec))
         name = job_name(spec.job_id, spec.attempt)
-        # An old attempt's outcome must never answer for this one.
-        (self._store.job_dir(spec.job_id) / OUTCOME_NAME).unlink(missing_ok=True)
-        self._write_spec_file(spec)
-        job = await self._create(self._job_object(template, own_pod, spec))
-        uid = job.get("metadata", {}).get("uid")
+        job = await self._create(self._job_object(template, own, spec))
         try:
+            uid = job.get("metadata", {}).get("uid")
             if not isinstance(uid, str) or not uid:
                 raise LauncherError(f"kubectl create returned Job {name} without a uid")
-            await self._create(self._env_secret(spec, uid))
-        except LauncherError:
+            await self._create(self._token_secret(spec, token, uid))
+        except BaseException:
             # Without its Secret the pod waits until the deadline, so remove the Job now.
-            await self._delete_job(name)
+            with anyio.CancelScope(shield=True):
+                await self._delete_quietly(name)
             raise
-        return await self._wait(name, spec.job_id, cancel)
+        return await self._wait(name, spec.job_id, spec.attempt, cancel)
 
     async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
-        """Wait for an attempt that an earlier control plane started. None: no such Job exists."""
+        """Wait for an attempt that an earlier control plane started.
+
+        None means no Job and no outcome exist for that attempt.
+        """
         name = job_name(job_id, attempt)
         if await self._get_job(name) is None:
-            return None
-        return await self._wait(name, job_id, cancel)
+            # The Job can be gone after its TTL while its outcome is on the claim.
+            return self._read_outcome(job_id, attempt)
+        return await self._wait(name, job_id, attempt, cancel)
 
     # The job object.
 
     def _load_template(self) -> dict[str, Any]:
+        path = self._template_path
         try:
-            template = json.loads(self._template.read_text(encoding="utf-8"))
+            template = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise LauncherError(f"cannot read the job template {self._template}: {exc}") from exc
+            raise LauncherError(f"cannot read the job template {path}: {exc}") from exc
         if not isinstance(template, dict):
-            raise LauncherError(f"the job template {self._template} must be a JSON object")
+            raise LauncherError(f"the job template {path} must be a JSON object")
         return template
 
-    async def _own_pod(self) -> tuple[str, dict[str, Any]]:
-        """Return the image and the config volume of this control-plane pod."""
+    async def _own_pod(self) -> OwnPod:
         pod_name = os.environ.get("POD_NAME")
         if not pod_name:
             raise LauncherError(
@@ -139,137 +151,187 @@ class K8sLauncher:
                 "deploy/k8s/deployment.yaml: the launcher copies the image and the config "
                 "volume of its own pod into each job pod."
             )
-        pod = json.loads(await self._kubectl("get", "pod", pod_name, "-o", "json"))
+        pod = await self._kubectl_json("get", "pod", pod_name, "-o", "json")
         try:
-            image = pod["spec"]["containers"][0]["image"]
+            image_id = pod["status"]["containerStatuses"][0]["imageID"]
             config = next(v for v in pod["spec"]["volumes"] if v["name"] == "config")
         except (KeyError, IndexError, TypeError, StopIteration) as exc:
             raise LauncherError(
-                f"pod {pod_name} has no image or no volume named config: {exc!r}"
+                f"pod {pod_name} has no image digest or no volume named config: {exc!r}"
             ) from exc
-        return image, config
+        for prefix in _IMAGE_ID_PREFIXES:
+            image_id = image_id.removeprefix(prefix)
+        if "@sha256:" not in image_id:
+            raise LauncherError(f"pod {pod_name} reports image {image_id!r}, not a digest")
+        # The digest, not the tag: a job pod runs the exact build of this control plane.
+        return OwnPod(image=image_id, config_volume=config)
 
     def _job_object(
-        self, template: dict[str, Any], own_pod: tuple[str, dict[str, Any]], spec: RunSpec
+        self, template: dict[str, Any], own: OwnPod, spec: AttemptSpec
     ) -> dict[str, Any]:
-        image, config_volume = own_pod
         job = copy.deepcopy(template)
         labels = {JOB_ID_LABEL: spec.job_id, ATTEMPT_LABEL: str(spec.attempt)}
         try:
             job.setdefault("metadata", {})["name"] = job_name(spec.job_id, spec.attempt)
             job["metadata"].setdefault("labels", {}).update(labels)
-            job_spec = job["spec"]
-            pod = job_spec["template"]
+            pod = job["spec"]["template"]
             pod.setdefault("metadata", {}).setdefault("labels", {}).update(labels)
-            container = pod["spec"]["containers"][0]
-            container["image"] = image
-            container["args"] = [*container["args"], "--job-id", spec.job_id]
-            volumes = pod["spec"]["volumes"]
-            env_volume = next(v for v in volumes if v["name"] == "env")
-            env_volume["secret"]["secretName"] = env_secret_name(spec.job_id, spec.attempt)
-            pod["spec"]["volumes"] = [v for v in volumes if v["name"] != "config"]
-            pod["spec"]["volumes"].append(config_volume)
+            pod_spec = pod["spec"]
+            container = pod_spec["containers"][0]
+            container["image"] = own.image
+            args = ["--job-id", spec.job_id, "--attempt", str(spec.attempt)]
+            container["args"] = [*container["args"], *args]
+            self._set_mounts(pod_spec, container, spec)
         except (KeyError, IndexError, TypeError, StopIteration) as exc:
             raise LauncherError(
-                f"the job template {self._template} lacks a part the launcher sets: {exc!r}. "
-                "It needs spec.template.spec.containers[0].args and an env secret volume."
+                f"the job template {self._template_path} lacks a part the launcher sets: "
+                f"{exc!r}. It needs containers[0].args and the volumes state, work, and token."
             ) from exc
-        job_spec["activeDeadlineSeconds"] = (
+        pod_spec["volumes"] = [v for v in pod_spec["volumes"] if v["name"] != "config"]
+        pod_spec["volumes"].append(own.config_volume)
+        # A retry repeats side effects (a push, a PR, a comment), whatever the template says.
+        job["spec"]["backoffLimit"] = 0
+        pod_spec["restartPolicy"] = "Never"
+        # The runner may need two kill grace periods to stop claude, and then writes the outcome.
+        pod_spec["terminationGracePeriodSeconds"] = 2 * self._cfg.kill_grace_seconds + 15
+        job["spec"]["activeDeadlineSeconds"] = (
             self._cfg.max_job_seconds + self._cfg.kill_grace_seconds + POD_DEADLINE_MARGIN_SECONDS
         )
-        job_spec["ttlSecondsAfterFinished"] = JOB_TTL_SECONDS
+        job["spec"]["ttlSecondsAfterFinished"] = JOB_TTL_SECONDS
         return job
 
-    def _env_secret(self, spec: RunSpec, job_uid: str) -> dict[str, Any]:
-        name = job_name(spec.job_id, spec.attempt)
+    def _set_mounts(
+        self, pod_spec: dict[str, Any], container: dict[str, Any], spec: AttemptSpec
+    ) -> None:
+        """Mount only this job's pod directory and this repo's checkout."""
+        paths = PodPaths.for_job(self._cfg.state_root, spec.job_id)
+        repo = parse_repo(spec.repo)
+        checkout = checkout_path(self._cfg.workspace_root, repo)
+        mounts = {m["name"]: m for m in container["volumeMounts"]}
+        mounts["state"]["mountPath"] = str(paths.root)
+        mounts["state"]["subPath"] = str(paths.root.relative_to(self._cfg.state_root))
+        mounts["work"]["mountPath"] = str(checkout)
+        mounts["work"]["subPath"] = str(checkout.relative_to(self._cfg.workspace_root))
+        token = next(v for v in pod_spec["volumes"] if v["name"] == "token")
+        token["secret"]["secretName"] = token_secret_name(spec.job_id, spec.attempt)
+        env = [e for e in container.get("env", []) if e.get("name") != "HOME"]
+        container["env"] = [*env, {"name": "HOME", "value": str(paths.home)}]
+
+    def _token_secret(self, spec: AttemptSpec, token: str, job_uid: str) -> dict[str, Any]:
         owner = {
             "apiVersion": "batch/v1",
             "kind": "Job",
-            "name": name,
+            "name": job_name(spec.job_id, spec.attempt),
             "uid": job_uid,
             "controller": False,
             # True would need update access to jobs/finalizers in the Role.
             "blockOwnerDeletion": False,
         }
-        data = {k: base64.b64encode(v.encode()).decode() for k, v in spec.env.items()}
         return {
             "apiVersion": "v1",
             "kind": "Secret",
             "type": "Opaque",
             "metadata": {
-                "name": env_secret_name(spec.job_id, spec.attempt),
+                "name": token_secret_name(spec.job_id, spec.attempt),
                 "labels": {JOB_ID_LABEL: spec.job_id, ATTEMPT_LABEL: str(spec.attempt)},
                 "ownerReferences": [owner],
             },
-            "data": data,
+            "data": {TOKEN_KEY: base64.b64encode(token.encode("utf-8")).decode("ascii")},
         }
-
-    def _write_spec_file(self, spec: RunSpec) -> None:
-        # The env holds the plan token and the claim is NFS, so the env goes in a Secret only.
-        data = {k: v for k, v in asdict(spec).items() if k != "env"}
-        path = self._store.job_dir(spec.job_id) / RUN_SPEC_NAME
-        write_private(path, json.dumps(data, default=str))
 
     # The wait.
 
-    async def _wait(self, name: str, job_id: str, cancel: anyio.Event) -> RunOutcome:
+    async def _wait(self, name: str, job_id: str, attempt: int, cancel: anyio.Event) -> RunOutcome:
         errors = 0
+        missing_outcome_since: float | None = None
         while True:
             if cancel.is_set():
-                await self._delete_job(name)
-                return RunOutcome("cancelled", "cancelled by a caller")
+                return await self._cancel(name)
             try:
                 job = await self._get_job(name)
-                errors = 0
             except LauncherError as exc:
+                # Never end the job while its pod may still run: a second pod would start in
+                # the same checkout. Keep asking, with a longer wait each time.
                 errors += 1
-                if errors > MAX_POLL_ERRORS:
-                    raise
-                _log.warning("job %s: cannot read Job %s, will retry: %s", job_id, name, exc)
-            else:
-                outcome = self._outcome_of(job, job_id)
-                if outcome is not None:
-                    return outcome
-            with anyio.move_on_after(self._poll):
-                await cancel.wait()
-
-    def _outcome_of(self, job: dict[str, Any] | None, job_id: str) -> RunOutcome | None:
-        """The outcome of a finished Job, or None while it runs."""
-        if job is None:
-            return self._read_outcome(job_id) or RunOutcome(
-                "interrupted", "pod_failed: the Job is gone and the pod recorded no outcome"
+                _log.warning("job %s: cannot read Job %s (try %d): %s", job_id, name, errors, exc)
+                await self._sleep(min(self._poll * 2**errors, MAX_POLL_BACKOFF_SECONDS), cancel)
+                continue
+            errors = 0
+            outcome, missing_outcome_since = self._outcome_of(
+                job, job_id, attempt, missing_outcome_since
             )
-        if _condition(job, "Complete") is not None:
-            return self._read_outcome(job_id) or RunOutcome(
-                "interrupted", "pod_failed: the pod exited 0 but recorded no outcome"
-            )
-        failed = _condition(job, "Failed")
-        if failed is None:
-            return None
-        recorded = self._read_outcome(job_id)
-        if recorded is not None:
-            return recorded
-        reason = f"{failed.get('reason', 'unknown')}: {failed.get('message', '')}".strip()
-        if failed.get("reason") == "DeadlineExceeded":
-            return RunOutcome("timeout", f"the job pod ran past activeDeadlineSeconds ({reason})")
-        return RunOutcome("interrupted", f"pod_failed: {reason}")
+            if outcome is not None:
+                return outcome
+            await self._sleep(self._poll, cancel)
 
-    def _read_outcome(self, job_id: str) -> RunOutcome | None:
-        path = self._store.job_dir(job_id) / OUTCOME_NAME
+    @staticmethod
+    async def _sleep(seconds: float, cancel: anyio.Event) -> None:
+        with anyio.move_on_after(seconds):
+            await cancel.wait()
+
+    async def _cancel(self, name: str) -> RunOutcome:
+        """Delete the Job, then wait until it is gone, so the repo is free only after the pod."""
+        deadline = anyio.current_time() + 2 * self._cfg.kill_grace_seconds + 60
+        while anyio.current_time() < deadline:
+            try:
+                await self._delete_job(name)
+                if await self._get_job(name) is None:
+                    break
+            except LauncherError as exc:
+                _log.warning("cancel of Job %s: %s", name, exc)
+            await anyio.sleep(max(self._poll, 0.01))
+        else:
+            _log.error("Job %s is still there after the cancel wait", name)
+        return RunOutcome("cancelled", "cancelled by a caller")
+
+    def _outcome_of(
+        self,
+        job: dict[str, Any] | None,
+        job_id: str,
+        attempt: int,
+        missing_since: float | None,
+    ) -> tuple[RunOutcome | None, float | None]:
+        """The outcome of a finished Job, or (None, ...) while it runs or its file is late."""
+        failed = _condition(job, "Failed") if job is not None else None
+        complete = job is None or _condition(job, "Complete") is not None
+        if not complete and failed is None:
+            return None, None
+        recorded = self._read_outcome_or_error(job_id, attempt)
+        if isinstance(recorded, RunOutcome):
+            return recorded, None
+        if failed is not None:
+            reason = f"{failed.get('reason', 'unknown')}: {failed.get('message', '')}".strip()
+            if failed.get("reason") == "DeadlineExceeded":
+                why = f"the job pod ran past activeDeadlineSeconds ({reason})"
+                return RunOutcome("timeout", why), None
+            return RunOutcome("interrupted", f"pod_failed: {reason}"), None
+        now = anyio.current_time()
+        missing_since = now if missing_since is None else missing_since
+        if recorded is None and now - missing_since < OUTCOME_GRACE_SECONDS:
+            return None, missing_since
+        why = recorded or "the pod finished but recorded no outcome"
+        return RunOutcome("interrupted", f"pod_failed: {why}"), None
+
+    def _read_outcome_or_error(self, job_id: str, attempt: int) -> RunOutcome | str | None:
+        """The recorded outcome, the reason it is not valid, or None when there is no file."""
+        path = PodPaths.for_job(self._cfg.state_root, job_id).outcome(attempt)
         try:
-            return outcome_from_json(path.read_text(encoding="utf-8"))
+            return outcome_from_json(read_pod_text(path))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError, TypeError) as exc:
-            _log.error("job %s: the outcome file %s is not valid: %s", job_id, path, exc)
-            return None
+        except PodFileError as exc:
+            _log.error("job %s: %s", job_id, exc)
+            return f"the outcome file is not valid: {exc}"
+
+    def _read_outcome(self, job_id: str, attempt: int) -> RunOutcome | None:
+        recorded = self._read_outcome_or_error(job_id, attempt)
+        return recorded if isinstance(recorded, RunOutcome) else None
 
     # kubectl.
 
     async def _create(self, obj: dict[str, Any]) -> dict[str, Any]:
         # create, never apply: an existing name is a bug in the attempt count, not an update.
-        out = await self._kubectl("create", "-f", "-", "-o", "json", stdin=json.dumps(obj))
-        return json.loads(out)
+        return await self._kubectl_json("create", "-f", "-", "-o", "json", stdin=json.dumps(obj))
 
     async def _get_job(self, name: str) -> dict[str, Any] | None:
         result = await self._run("get", "job", name, "-o", "json")
@@ -277,13 +339,34 @@ class K8sLauncher:
             if b"NotFound" in result.stderr:
                 return None
             raise self._error(("get", "job", name), result.returncode, result.stderr)
-        return json.loads(result.stdout)
+        return self._parse(("get", "job", name), result.stdout)
 
     async def _delete_job(self, name: str) -> None:
-        # Background propagation deletes the pod and the owned env Secret with the Job.
+        # Background propagation deletes the pod and the owned token Secret with the Job.
         await self._kubectl(
             "delete", "job", name, "--cascade=background", "--ignore-not-found", "--wait=false"
         )
+
+    async def _delete_quietly(self, name: str) -> None:
+        try:
+            await self._delete_job(name)
+        except LauncherError as exc:
+            _log.error("cannot delete Job %s after a failed launch: %s", name, exc)
+
+    async def _kubectl_json(self, *args: str, stdin: str = "") -> dict[str, Any]:
+        return self._parse(args, await self._kubectl(*args, stdin=stdin))
+
+    @staticmethod
+    def _parse(args: tuple[str, ...], out: bytes) -> dict[str, Any]:
+        try:
+            data = json.loads(out)
+        except ValueError as exc:
+            raise LauncherError(
+                f"kubectl {' '.join(args)} returned output that is not JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise LauncherError(f"kubectl {' '.join(args)} returned JSON that is not an object")
+        return data
 
     async def _kubectl(self, *args: str, stdin: str = "") -> bytes:
         result = await self._run(*args, stdin=stdin)

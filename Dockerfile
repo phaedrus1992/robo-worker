@@ -33,7 +33,7 @@ RUN apt-get update \
 # The worker is non-root. The mount points exist in the image, because the root filesystem
 # is read-only at run time.
 RUN useradd --create-home --uid 10001 --user-group worker \
-    && mkdir -p /app /work /state /run/robo-worker/env \
+    && mkdir -p /app /work /state /run/robo-worker/token \
         /etc/robo-worker/config /etc/robo-worker/secrets /etc/robo-worker/gh /etc/robo-worker/git \
     && chown worker:worker /app /work /state
 

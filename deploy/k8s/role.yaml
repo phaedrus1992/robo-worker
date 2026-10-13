@@ -1,4 +1,4 @@
-# The control plane creates, watches, and deletes the job Jobs and their env Secrets, and
+# The control plane creates, watches, and deletes the job Jobs and their token Secrets, and
 # reads its own Pod for the image and the config volume. No patch and no update: the
 # launcher only creates. Nothing cluster-scoped.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -13,7 +13,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get"]
+    verbs: ["create", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]

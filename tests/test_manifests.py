@@ -49,13 +49,16 @@ def test_the_job_pod_is_restricted() -> None:
     assert pod["automountServiceAccountToken"] is False
 
 
-def test_the_job_pod_gets_its_env_from_a_volume_only() -> None:
+def test_the_job_pod_mounts_no_shared_state_by_itself() -> None:
+    # The launcher sets a subPath per job. A template used as is must not mount whole claims.
     pod = _job_pod()["spec"]["template"]["spec"]
     container = pod["containers"][0]
     assert "envFrom" not in container
-    assert [e["name"] for e in container["env"]] == ["HOME"]
-    mounts = {m["name"]: m["mountPath"] for m in container["volumeMounts"]}
-    assert mounts["env"] == "/run/robo-worker/env"
+    assert "env" not in container
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    assert mounts["state"]["subPath"] == "set-by-the-launcher"
+    assert mounts["work"]["subPath"] == "set-by-the-launcher"
+    assert mounts["token"]["mountPath"] == "/run/robo-worker/token"
     # The job pod never mounts the callers file or the token Secret of the control plane.
     assert "secrets" not in {v["name"] for v in pod["volumes"]}
 
@@ -90,6 +93,9 @@ def test_the_role_is_namespaced_and_create_only() -> None:
     assert "patch" not in verbs
     assert "update" not in verbs
     assert "*" not in verbs
+    # The launcher never reads a Secret, so the Role cannot either.
+    secrets_rule = text[text.index('resources: ["secrets"]') :].splitlines()[1]
+    assert "get" not in secrets_rule
 
 
 def test_the_deployed_config_names_the_mounted_template() -> None:

@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+bats_require_minimum_version 1.5.0
+
 REF=v0.1.0
 
 setup() {
@@ -76,13 +78,13 @@ EOF
   RUNNING=2 run scripts/deploy.sh "$REF"
   [ "$status" -eq 5 ]
   [[ "$output" == *"2 job(s) active"* ]]
-  ! grep -q "apply" "$LOG"
+  run ! grep -q "apply" "$LOG"
 }
 
 @test "refuses to deploy when it cannot count the active jobs" {
   JOBS_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 5 ]
-  ! grep -q "apply" "$LOG"
+  run ! grep -q "apply" "$LOG"
 }
 
 @test "--force deploys while jobs run" {
@@ -108,7 +110,7 @@ EOF
   run scripts/deploy.sh "$REF"
   [ "$status" -eq 0 ]
   grep -q "checkout -q --detach $REF" "$GIT_LOG"
-  ! grep -q "worktree add" "$GIT_LOG"
+  run ! grep -q "worktree add" "$GIT_LOG"
 }
 
 @test "rolls back to the old revision when the service is not healthy" {
@@ -121,7 +123,7 @@ EOF
 @test "an apply that fails before the Deployment changes undoes nothing" {
   APPLY_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 3 ]
-  ! grep -q "rollout undo" "$LOG"
+  run ! grep -q "rollout undo" "$LOG"
   [[ "$output" == *"still at revision 3"* ]]
 }
 
@@ -135,17 +137,17 @@ EOF
   HEALTH_OK=false run scripts/deploy.sh "$REF"
   [ "$status" -eq 4 ]
   [[ "$output" == *"no revision exists"* ]]
-  ! grep -q "rollout undo" "$LOG"
+  run ! grep -q "rollout undo" "$LOG"
 }
 
 @test "exit 6 when git fetch fails" {
   FAIL_FETCH=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 6 ]
-  ! grep -q "apply" "$LOG"
+  run ! grep -q "apply" "$LOG"
 }
 
 @test "exit 6 when the Deployment cannot be read" {
   GET_DEPLOY_EXIT=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 6 ]
-  ! grep -q "apply" "$LOG"
+  run ! grep -q "apply" "$LOG"
 }

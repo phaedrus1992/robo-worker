@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import tempfile
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -9,6 +10,8 @@ from typing import Any
 
 import anyio
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from robo_worker import attempt as attempt_module
 from robo_worker.attempt import AttemptSpec, PodPaths
@@ -712,3 +715,31 @@ async def test_an_attempt_that_stops_before_claude_does_not_start_the_session(
     assert final.started is False
     assert final.interruptions == 0
     assert launcher.specs[0].resume is False
+
+
+_STATES = st.sampled_from(list(JobState))
+_JOB_ROWS = st.lists(
+    st.tuples(st.sampled_from(["o/a", "o/b", "o/c"]), _STATES, st.booleans()), max_size=6
+)
+
+
+@settings(max_examples=40, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(rows=_JOB_ROWS)
+def test_repo_owners_invariants(config: Config, rows: list[tuple[str, JobState, bool]]) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = JobStore(Path(tmp))
+        jobs = []
+        for repo, state, started in rows:
+            job = store.create(repo=repo, prompt="p", tags=[], caller="agent")
+            job.state, job.started = state, started
+            store.save(job)
+            jobs.append(job)
+        owners = make_scheduler(replace(config, state_root=Path(tmp)), store)._repo_owners()
+
+    holding = (JobState.BLOCKED, JobState.RATE_LIMITED, JobState.QUEUED)
+    by_id = {j.id: j for j in jobs}
+    for repo, owner in owners.items():
+        assert by_id[owner].repo == repo
+        assert by_id[owner].started
+        assert by_id[owner].state in holding
+    assert set(owners) == {j.repo for j in jobs if j.started and j.state in holding}

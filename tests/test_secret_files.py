@@ -1,8 +1,12 @@
 import os
 import stat
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from robo_worker.secret_files import (
     MIN_TOKEN_LENGTH,
@@ -114,3 +118,25 @@ def test_write_private_leaves_no_temp_file(tmp_path: Path) -> None:
     write_private(tmp_path / "a.json", "1")
     write_private(tmp_path / "a.json", "2")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.json"]
+
+
+def _allowed(mode: int, same_group: bool) -> bool:
+    """The reference rule: no bit for others, and a group bit only as a read by our group."""
+    if mode & 0o007:
+        return False
+    return not mode & 0o070 or (same_group and not mode & 0o030)
+
+
+@settings(max_examples=150)
+@given(st.integers(min_value=0, max_value=0o777), st.booleans())
+def test_read_secret_follows_the_reference_rule(mode: int, same_group: bool) -> None:
+    mode |= 0o400  # the owner can always read, so only the access rule decides
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _secret(Path(tmp) / "t", "x", mode)
+        gid = path.stat().st_gid
+        with patch.object(os, "getegid", return_value=gid if same_group else gid + 1):
+            if _allowed(mode, same_group):
+                assert read_secret(path) == "x"
+            else:
+                with pytest.raises(SecretError, match="chmod 600"):
+                    read_secret(path)

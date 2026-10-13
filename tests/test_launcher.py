@@ -5,6 +5,8 @@ from pathlib import Path
 
 import anyio
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from robo_worker import launcher as launcher_module
 from robo_worker.attempt import AttemptSpec, PodPaths, spec_from_json
@@ -14,6 +16,8 @@ from robo_worker.launcher import (
     POD_DEADLINE_MARGIN_SECONDS,
     K8sLauncher,
     LauncherError,
+    OwnPod,
+    job_name,
 )
 from tests.conftest import FakeKubectl
 
@@ -287,3 +291,29 @@ async def test_a_kubectl_failure_names_the_command(
 ) -> None:
     with pytest.raises(LauncherError, match=r"kubectl .*get pod"):
         await _launcher(replace(config, kubectl_bin="false")).check()
+
+
+@settings(max_examples=60, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(
+    job_id=st.from_regex(r"[0-9a-f]{32}", fullmatch=True),
+    attempt=st.integers(min_value=1, max_value=10_000),
+    resume=st.booleans(),
+)
+def test_job_object_invariants(config: Config, job_id: str, attempt: int, resume: bool) -> None:
+    launcher = _launcher(config)
+    template = json.loads(config.job_template.read_text())
+    before = json.dumps(template, sort_keys=True)
+    own = OwnPod(image="img@sha256:" + "d" * 64, config_volume={"name": "config", "configMap": {}})
+    spec = replace(SPEC, job_id=job_id, attempt=attempt, resume=resume)
+
+    job = launcher._job_object(template, own, spec)
+
+    assert json.dumps(template, sort_keys=True) == before  # the template is not changed
+    assert job["metadata"]["name"] == job_name(job_id, attempt)
+    pod = job["spec"]["template"]["spec"]
+    assert pod["containers"][0]["args"][-4:] == ["--job-id", job_id, "--attempt", str(attempt)]
+    assert job["spec"]["backoffLimit"] == 0
+    assert pod["restartPolicy"] == "Never"
+    assert [v for v in pod["volumes"] if v["name"] == "config"] == [own.config_volume]
+    mounts = {m["name"]: m for m in pod["containers"][0]["volumeMounts"]}
+    assert mounts["state"]["subPath"] == f"jobs/{job_id}/pod"

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Queue jobs per repo, pause on an auth failure, the plan rate limit, or a dirty checkout, and resume interrupted jobs after a restart [feat]
 - Add a text-only `ask` call [feat]
 - Serve the job tools over MCP with a bearer token per caller, plus an open `/health` route [feat]
-- Add the `robo-worker` CLI, a systemd unit, a deploy script with rollback, and host setup docs [feat]
+- Run each attempt of a job in its own k8s Job pod, and reattach to a running pod after a control-plane restart instead of stopping it [feat:scheduler]
+- Add `robo-worker serve` for the control plane and `robo-worker job` for the job pod [feat:cli]
+- Build the `ghcr.io/phaedrus1992/robo-worker` image, with every binary pinned by version and checksum [build]
+- Add k8s manifests under `deploy/k8s`: a control-plane Deployment, a NodePort Service, two claims, and a namespaced Role [feat:deploy]
+- Deploy with `scripts/deploy.sh [git-ref]`, which refuses while a job pod runs and rolls back to the revision that ran before [feat:deploy]
+- Keep each job pod to its own job directory and repo checkout, and never run a program on data that a job pod wrote [fix:security]
 
 [Unreleased]: https://github.com/phaedrus1992/robo-worker/commits/main

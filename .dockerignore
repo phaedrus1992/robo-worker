@@ -1,0 +1,12 @@
+.git/
+.venv/
+.tmp/
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+dist/
+deploy/
+docs/
+scripts/
+tests/

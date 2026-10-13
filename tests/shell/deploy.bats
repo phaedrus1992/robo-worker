@@ -1,145 +1,151 @@
 #!/usr/bin/env bats
 
-OLD_SHA=0123456789abcdef0123456789abcdef01234567
+REF=v0.1.0
 
 setup() {
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$BIN"
-  export LOG="$BATS_TEST_TMPDIR/log" COUNT="$BATS_TEST_TMPDIR/curl-count" OLD_SHA
-  cat >"$BIN/ssh" <<'EOF'
+  export LOG="$BATS_TEST_TMPDIR/kubectl-log" GIT_LOG="$BATS_TEST_TMPDIR/git-log"
+  export REV_FILE="$BATS_TEST_TMPDIR/revision" REF
+  echo "${START_REV-3}" >"$REV_FILE"
+  cat >"$BIN/kubectl" <<'EOF'
 #!/usr/bin/env bash
-input="$(cat)"
-echo "ssh $* :: $input" >>"$LOG"
-if [[ "$input" == *"rev-parse HEAD"* ]]; then
-  [[ -n "${FAIL_REVPARSE:-}" ]] && exit 1
-  echo "$OLD_SHA"
-fi
-if [[ -n "${FAIL_FETCH:-}" && "$input" == *"git fetch"* ]]; then exit 1; fi
-if [[ -n "${FAIL_SYNC:-}" && "$input" == *"uv sync"* && "$input" != *"$OLD_SHA"* ]]; then
-  exit 1
-fi
+echo "kubectl $*" >>"$LOG"
+shift 2 # -n <namespace>
+case "$1 $2" in
+"get --raw")
+  if [[ "${HEALTH_OK:-true}" == "true" ]]; then echo '{"ok":true}'; else
+    echo '{"ok":false,"problems":["token expired"]}'
+  fi
+  ;;
+"get jobs")
+  [[ -z "${JOBS_EXIT:-}" ]] || exit "$JOBS_EXIT"
+  # One finished Job always, so the count must skip it.
+  items='{"status":{"succeeded":1}}'
+  for ((i = 0; i < ${RUNNING:-0}; i++)); do items+=',{"status":{"active":1}}'; done
+  echo "{\"items\":[${items}]}"
+  ;;
+"get deployment/robo-worker")
+  [[ -z "${GET_DEPLOY_EXIT:-}" ]] || exit "$GET_DEPLOY_EXIT"
+  rev="$(cat "$REV_FILE")"
+  [[ -z "$rev" ]] && exit 0 # --ignore-not-found prints nothing
+  echo "{\"metadata\":{\"annotations\":{\"deployment.kubernetes.io/revision\":\"$rev\"}}}"
+  ;;
+"apply -k")
+  [[ -z "${APPLY_EXIT:-}" ]] || exit "$APPLY_EXIT"
+  echo 4 >"$REV_FILE"
+  ;;
+"rollout status") exit "${ROLLOUT_EXIT:-0}" ;;
+"rollout undo")
+  [[ -z "${UNDO_EXIT:-}" ]] || exit "$UNDO_EXIT"
+  echo 5 >"$REV_FILE"
+  ;;
+*) exit 0 ;;
+esac
+EOF
+  cat >"$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+echo "git $*" >>"$GIT_LOG"
+if [[ -n "${FAIL_FETCH:-}" && "$*" == *" fetch "* ]]; then exit 1; fi
 exit 0
 EOF
-  cat >"$BIN/curl" <<'EOF'
-#!/usr/bin/env bash
-n=$(($(cat "$COUNT" 2>/dev/null || echo 0) + 1))
-echo "$n" >"$COUNT"
-echo "curl $n $*" >>"$LOG"
-if [[ "$n" -eq 1 ]]; then
-  [[ -n "${CURL_DOWN:-}" ]] && exit 7
-  printf '{"running": %s}\n%s' "${RUNNING:-0}" "${FIRST_CODE:-200}"
-  exit 0
-fi
-if [[ "$n" -le "${HEALTH_FAIL_UNTIL:-1}" ]]; then
-  printf '{"ok": false, "problems": ["token expired"]}\n503'
-  exit 0
-fi
-printf '{"ok": true}\n200'
-EOF
-  chmod +x "$BIN/ssh" "$BIN/curl"
+  chmod +x "$BIN/kubectl" "$BIN/git"
   export PATH="$BIN:$PATH" ROBO_WORKER_HEALTH_TRIES=2 ROBO_WORKER_HEALTH_DELAY=0
+  export ROBO_WORKER_APP_DIR="$BATS_TEST_TMPDIR/app"
+  export ROBO_WORKER_DEPLOY_DIR="$BATS_TEST_TMPDIR/deploy"
 }
 
 @test "usage error exits 2" {
-  run scripts/deploy.sh
+  run scripts/deploy.sh a b
   [ "$status" -eq 2 ]
+  [ ! -e "$LOG" ]
 }
 
 @test "a ref with shell characters exits 2" {
-  run scripts/deploy.sh host http://h/health 'main;reboot'
+  run scripts/deploy.sh 'main;reboot'
   [ "$status" -eq 2 ]
-}
-
-@test "refuses to restart while jobs run" {
-  RUNNING=2 run scripts/deploy.sh host http://h/health
-  [ "$status" -eq 5 ]
-  ! grep -q systemctl "$LOG"
-}
-
-@test "--force deploys while jobs run" {
-  RUNNING=2 run scripts/deploy.sh --force host http://h/health
-  [ "$status" -eq 0 ]
-}
-
-@test "deploys the ref and restarts the unit" {
-  run scripts/deploy.sh host http://h/health v0.1.0
-  [ "$status" -eq 0 ]
-  grep -q "git checkout -q --detach v0.1.0" "$LOG"
-  grep -q "systemctl restart robo-worker" "$LOG"
-}
-
-@test "rolls back when the health check fails" {
-  HEALTH_FAIL_UNTIL=3 run scripts/deploy.sh host http://h/health v0.1.0
-  [ "$status" -eq 3 ]
-  grep -q "detach $OLD_SHA" "$LOG"
-}
-
-@test "rolls back when uv sync fails" {
-  FAIL_SYNC=1 run scripts/deploy.sh host http://h/health v0.1.0
-  [ "$status" -eq 3 ]
-  grep -q "detach $OLD_SHA" "$LOG"
-}
-
-@test "exit 4 when the rollback fails too" {
-  HEALTH_FAIL_UNTIL=99 run scripts/deploy.sh host http://h/health v0.1.0
-  [ "$status" -eq 4 ]
+  [ ! -e "$LOG" ]
 }
 
 @test "a ref that starts with a dash exits 2" {
-  run scripts/deploy.sh host http://h/health -h
+  run scripts/deploy.sh -h
   [ "$status" -eq 2 ]
 }
 
-@test "a unit name with shell characters exits 2" {
-  ROBO_WORKER_UNIT='robo-worker;reboot' run scripts/deploy.sh host http://h/health
-  [ "$status" -eq 2 ]
-  [ ! -e "$LOG" ]
-}
-
-@test "refuses when the running job count cannot be read" {
-  CURL_DOWN=1 run scripts/deploy.sh host http://h/health
+@test "refuses to deploy while jobs run" {
+  RUNNING=2 run scripts/deploy.sh "$REF"
   [ "$status" -eq 5 ]
-  [[ "$output" == *"cannot read the running job count"* ]]
-  ! grep -q systemctl "$LOG"
+  [[ "$output" == *"2 job(s) active"* ]]
+  ! grep -q "apply" "$LOG"
 }
 
-@test "--force deploys when the running job count cannot be read" {
-  CURL_DOWN=1 run scripts/deploy.sh --force host http://h/health
+@test "refuses to deploy when it cannot count the active jobs" {
+  JOBS_EXIT=1 run scripts/deploy.sh "$REF"
+  [ "$status" -eq 5 ]
+  ! grep -q "apply" "$LOG"
+}
+
+@test "--force deploys while jobs run" {
+  RUNNING=2 run scripts/deploy.sh --force "$REF"
   [ "$status" -eq 0 ]
 }
 
-@test "reads running jobs from a 503 health body" {
-  FIRST_CODE=503 RUNNING=2 run scripts/deploy.sh host http://h/health
-  [ "$status" -eq 5 ]
-  [[ "$output" == *"2 job(s) running"* ]]
+@test "--force deploys when it cannot count the active jobs" {
+  JOBS_EXIT=1 run scripts/deploy.sh --force "$REF"
+  [ "$status" -eq 0 ]
 }
 
-@test "a failed health check prints the service problems" {
-  HEALTH_FAIL_UNTIL=99 run scripts/deploy.sh host http://h/health v0.1.0
-  [ "$status" -eq 4 ]
+@test "deploys the ref and applies the manifests" {
+  run scripts/deploy.sh "$REF"
+  [ "$status" -eq 0 ]
+  grep -q "worktree add -q --detach $ROBO_WORKER_DEPLOY_DIR $REF" "$GIT_LOG"
+  grep -q "apply -k $ROBO_WORKER_DEPLOY_DIR/deploy/k8s" "$LOG"
+  grep -q "rollout status deployment/robo-worker" "$LOG"
+}
+
+@test "a later deploy reuses the deploy worktree" {
+  mkdir -p "$ROBO_WORKER_DEPLOY_DIR/.git"
+  run scripts/deploy.sh "$REF"
+  [ "$status" -eq 0 ]
+  grep -q "checkout -q --detach $REF" "$GIT_LOG"
+  ! grep -q "worktree add" "$GIT_LOG"
+}
+
+@test "rolls back to the old revision when the service is not healthy" {
+  HEALTH_OK=false run scripts/deploy.sh "$REF"
+  [ "$status" -eq 3 ]
+  grep -q "rollout undo deployment/robo-worker --to-revision=3" "$LOG"
   [[ "$output" == *"problem: token expired"* ]]
 }
 
-@test "a host that starts with a dash exits 2" {
-  run scripts/deploy.sh -oProxyCommand=x http://h/health
-  [ "$status" -eq 2 ]
-  [ ! -e "$LOG" ]
+@test "an apply that fails before the Deployment changes undoes nothing" {
+  APPLY_EXIT=1 run scripts/deploy.sh "$REF"
+  [ "$status" -eq 3 ]
+  ! grep -q "rollout undo" "$LOG"
+  [[ "$output" == *"still at revision 3"* ]]
 }
 
-@test "a health url that is not http exits 2" {
-  run scripts/deploy.sh host file:///etc/passwd
-  [ "$status" -eq 2 ]
-  [ ! -e "$LOG" ]
+@test "exit 4 when the rollback fails too" {
+  HEALTH_OK=false UNDO_EXIT=1 run scripts/deploy.sh "$REF"
+  [ "$status" -eq 4 ]
 }
 
-@test "exit 6 when the current commit cannot be read" {
-  FAIL_REVPARSE=1 run scripts/deploy.sh host http://h/health
-  [ "$status" -eq 6 ]
-  ! grep -q systemctl "$LOG"
+@test "exit 4 when the first deploy fails, with nothing to roll back to" {
+  START_REV="" setup
+  HEALTH_OK=false run scripts/deploy.sh "$REF"
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"no revision exists"* ]]
+  ! grep -q "rollout undo" "$LOG"
 }
 
 @test "exit 6 when git fetch fails" {
-  FAIL_FETCH=1 run scripts/deploy.sh host http://h/health
+  FAIL_FETCH=1 run scripts/deploy.sh "$REF"
   [ "$status" -eq 6 ]
-  ! grep -q "checkout" "$LOG"
+  ! grep -q "apply" "$LOG"
+}
+
+@test "exit 6 when the Deployment cannot be read" {
+  GET_DEPLOY_EXIT=1 run scripts/deploy.sh "$REF"
+  [ "$status" -eq 6 ]
+  ! grep -q "apply" "$LOG"
 }

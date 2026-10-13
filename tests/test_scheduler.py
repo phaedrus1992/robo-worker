@@ -188,6 +188,67 @@ async def test_dirty_checkout_pauses_the_repo(
         scheduler.resume_queue("o/other")
 
 
+async def test_a_blocked_job_holds_its_repo_and_resumes_on_its_dirty_tree(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    make_origin(tmp_path)
+    scratch = config.workspace_root / "o" / "r" / "scratch.txt"
+    set_env("blocked.jsonl", "success.jsonl", FAKE_CLAUDE_TOUCH=str(scratch))
+    scheduler = make_scheduler(config, store)
+    first = scheduler.submit("o/r", "one", None, "agent")
+    async with running(scheduler):
+        await wait_state(store, first.id, JobState.BLOCKED)
+        second = scheduler.submit("o/r", "two", None, "agent")
+        await anyio.sleep(0.5)
+        # The blocked job left work in progress, and its session expects to find it.
+        assert "o/r" not in scheduler.pauses.repos
+        assert store.get(second.id).state is JobState.QUEUED
+        scheduler.resume(first.id, "README.md")
+        await wait_state(store, first.id, JobState.DONE)
+        await anyio.sleep(0.2)
+    # The job ended with the tree still dirty, so now the repo pauses.
+    assert scheduler.pauses.repos["o/r"].startswith("checkout_dirty")
+    assert store.get(second.id).state is JobState.QUEUED
+    assert len(records(tmp_path)) == 2
+
+
+class DirtyingLauncher:
+    """The first launch leaves a file and dies, as a pod killed mid-task does."""
+
+    def __init__(self) -> None:
+        self.specs: list[RunSpec] = []
+
+    async def __call__(
+        self, spec: RunSpec, settings: RunSettings, *, cancel: anyio.Event
+    ) -> RunOutcome:
+        self.specs.append(spec)
+        if len(self.specs) == 1:
+            (spec.cwd / "half-done.txt").write_text("wip\n")
+            return RunOutcome("interrupted", "pod_failed: Evicted")
+        (spec.cwd / "half-done.txt").unlink()
+        return RunOutcome("done", "ok")
+
+    async def attach(self, job_id: str, attempt: int, *, cancel: anyio.Event) -> RunOutcome | None:
+        return None
+
+
+async def test_an_interrupted_job_resumes_on_its_dirty_tree(
+    tmp_path: Path, config: Config, store: JobStore, set_env: SetEnv
+) -> None:
+    set_env("success.jsonl")
+    make_origin(tmp_path)
+    launcher = DirtyingLauncher()
+    job = store.create(repo="o/r", prompt="p", tags=[], caller="agent")
+    scheduler = make_scheduler(config, store, launch=launcher)
+    async with running(scheduler):
+        finished = await wait_state(store, job.id, JobState.DONE, JobState.FAILED)
+        await anyio.sleep(0.2)
+
+    assert finished.state is JobState.DONE
+    assert [s.resume for s in launcher.specs] == [False, True]
+    assert "o/r" not in scheduler.pauses.repos
+
+
 async def test_recover_after_restart(config: Config, store: JobStore, set_env: SetEnv) -> None:
     set_env("success.jsonl")
     clock = Clock()
@@ -457,7 +518,11 @@ async def test_cancel_during_a_dirty_prepare_is_not_lost(
     entered, release = anyio.Event(), anyio.Event()
 
     async def blocked_checkout(
-        git_bin: str, root: Path, repo: RepoName, template: str, timeout: float
+        git_bin: str,
+        root: Path,
+        repo: RepoName,
+        template: str,
+        timeout: float,
     ) -> Path:
         entered.set()
         await release.wait()

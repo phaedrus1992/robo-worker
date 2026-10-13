@@ -20,6 +20,7 @@ from robo_worker.checkout import (
     checkout_path,
     is_dirty,
     prepare_checkout,
+    sync_checkout,
 )
 from robo_worker.config import Config
 from robo_worker.env import (
@@ -253,14 +254,30 @@ class Scheduler:
         for job in self._store.all(JobState.RATE_LIMITED):
             self._store.transition(job, JobState.QUEUED)
 
+    def _repo_owners(self) -> dict[str, str]:
+        """Map each repo to the started, unfinished job that owns its checkout.
+
+        A blocked, rate-limited, or interrupted job left its session and its work in progress
+        in the checkout, and its resume expects to find both. No other job may start there.
+        """
+        owners: dict[str, str] = {}
+        for state in (JobState.BLOCKED, JobState.RATE_LIMITED, JobState.QUEUED):
+            for job in self._store.all(state):
+                if job.started:
+                    owners.setdefault(job.repo, job.id)
+        return owners
+
     def _dispatch(self, tg: TaskGroup) -> None:
         self._release_rate_limit()
         if self.pauses.auth or self.pauses.rate_limit_until is not None:
             return
+        owners = self._repo_owners()
         for job in self._store.all(JobState.QUEUED):
             if len(self._busy) >= self._cfg.max_parallel_jobs:
                 return
             if job.repo in self._busy or job.repo in self.pauses.repos:
+                continue
+            if owners.get(job.repo, job.id) != job.id:
                 continue
             self._busy.add(job.repo)
             self._cancels[job.id] = anyio.Event()
@@ -314,8 +331,10 @@ class Scheduler:
             _log.warning("all queues paused for auth: %s", exc)
             self._store.append_event(job.id, "queue_paused", {"reason": f"auth: {exc}"})
             return None
+        # A resume runs on the tree its own session left, dirty or not.
+        checkout = sync_checkout if job.started else prepare_checkout
         try:
-            cwd = await prepare_checkout(
+            cwd = await checkout(
                 self._cfg.git_bin,
                 self._cfg.workspace_root,
                 parse_repo(job.repo),
@@ -431,6 +450,9 @@ class Scheduler:
         self._store.append_event(job.id, "queue_paused", {"reason": reason})
 
     async def _check_dirty_after(self, job: Job, cwd: Path) -> None:
+        if job.state not in TERMINAL:
+            # The job comes back to this tree: blocked, rate-limited, or requeued.
+            return
         try:
             dirty = await is_dirty(self._cfg.git_bin, cwd, self._cfg.max_prepare_seconds)
         except CheckoutError as exc:

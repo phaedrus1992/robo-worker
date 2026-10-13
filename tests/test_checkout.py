@@ -10,6 +10,7 @@ from robo_worker.checkout import (
     checkout_path,
     is_dirty,
     prepare_checkout,
+    sync_checkout,
 )
 from robo_worker.repos import RepoName
 from tests.conftest import make_origin
@@ -53,6 +54,14 @@ async def test_refuses_a_dirty_checkout(tmp_path: Path) -> None:
     (path / "scratch.txt").write_text("wip\n")
     with pytest.raises(DirtyCheckout, match=r"resume_queue\('o/r'\)"):
         await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
+
+
+async def test_a_resume_accepts_its_own_dirty_checkout(tmp_path: Path) -> None:
+    make_origin(tmp_path)
+    path = await prepare_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
+    (path / "scratch.txt").write_text("wip\n")
+    again = await sync_checkout("git", tmp_path / "work", REPO, _template(tmp_path), LIMIT)
+    assert (again / "scratch.txt").read_text() == "wip\n"
 
 
 async def test_clone_failure_names_the_command(tmp_path: Path) -> None:

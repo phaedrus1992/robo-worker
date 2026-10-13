@@ -40,10 +40,13 @@ async def is_dirty(git_bin: str, path: Path, timeout: float) -> bool:
     return bool((await _git(git_bin, ["status", "--porcelain"], timeout, cwd=path)).strip())
 
 
-async def prepare_checkout(
+async def sync_checkout(
     git_bin: str, workspace_root: Path, repo: RepoName, clone_url_template: str, timeout: float
 ) -> Path:
-    """Clone or fetch the checkout for ``repo`` and return its path, refusing a dirty tree."""
+    """Clone or fetch the checkout for ``repo`` and return its path, dirty or not.
+
+    A job that resumes its own session owns the changes it left, so it uses this directly.
+    """
     path = checkout_path(workspace_root, repo)
     if (path / ".git").exists():
         await _git(git_bin, ["fetch", "--prune", "origin"], timeout, cwd=path)
@@ -51,6 +54,14 @@ async def prepare_checkout(
         path.parent.mkdir(parents=True, exist_ok=True)
         url = clone_url_template.format(owner=repo.owner, name=repo.name)
         await _git(git_bin, ["clone", "--quiet", "--", url, str(path)], timeout)
+    return path
+
+
+async def prepare_checkout(
+    git_bin: str, workspace_root: Path, repo: RepoName, clone_url_template: str, timeout: float
+) -> Path:
+    """Clone or fetch the checkout for ``repo`` and return its path, refusing a dirty tree."""
+    path = await sync_checkout(git_bin, workspace_root, repo, clone_url_template, timeout)
     if await is_dirty(git_bin, path, timeout):
         raise DirtyCheckout(
             f"{path} has uncommitted changes. Clean it, then call resume_queue('{repo.slug}')."

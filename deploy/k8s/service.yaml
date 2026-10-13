@@ -1,0 +1,17 @@
+# Job pods reach MCP at robo-worker.phaedrus.svc:8765. Callers on the LAN use the node port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: robo-worker
+  labels:
+    app.kubernetes.io/name: robo-worker
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: robo-worker
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: mcp
+      port: 8765
+      targetPort: 8765
+      nodePort: 30875

@@ -3,22 +3,49 @@ from pathlib import Path
 import pytest
 
 from robo_worker.cli import main
+from robo_worker.job_main import EXIT_BAD_INPUT
 
 EXAMPLE = Path(__file__).parent.parent / "config.example.toml"
 
 
 def test_missing_config_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["--config", str(tmp_path / "nope.toml")]) == 2
+    assert main(["serve", "--config", str(tmp_path / "nope.toml")]) == 2
+    assert "cannot read config" in capsys.readouterr().err
+
+
+def test_job_mode_with_a_missing_config_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["job", "--config", str(tmp_path / "nope.toml"), "--job-id", "a" * 32]) == 2
     assert "cannot read config" in capsys.readouterr().err
 
 
 def test_missing_callers_file_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
-    # The example config points at /home/robo-worker/secrets/callers.toml, absent here.
-    assert main(["--config", str(EXAMPLE)]) == 2
+    # The example config points at /etc/robo-worker/secrets/callers.toml, absent here.
+    assert main(["serve", "--config", str(EXAMPLE)]) == 2
     assert "callers.toml" in capsys.readouterr().err
 
 
-def test_config_flag_is_required(capsys: pytest.CaptureFixture[str]) -> None:
+def test_job_mode_needs_no_callers_file(tmp_path: Path) -> None:
+    # A job pod reads no callers file. This job has no run spec, so it records nothing.
+    config = tmp_path / "config.toml"
+    config.write_text(EXAMPLE.read_text().replace('"/state"', f'"{tmp_path / "state"}"'))
+    assert main(["job", "--config", str(config), "--job-id", "a" * 32]) == EXIT_BAD_INPUT
+
+
+def test_config_flag_is_required() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["serve"])
+    assert exc.value.code == 2
+
+
+def test_a_subcommand_is_required() -> None:
     with pytest.raises(SystemExit) as exc:
         main([])
+    assert exc.value.code == 2
+
+
+def test_job_mode_needs_a_job_id(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["job", "--config", str(tmp_path / "c.toml")])
     assert exc.value.code == 2

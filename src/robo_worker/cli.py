@@ -1,7 +1,12 @@
-"""Command line entry point: robo-worker --config <file>."""
+"""Command line entry point.
+
+`serve` is the control plane: the MCP server, the queues, and the job launcher.
+`job` is the job-pod entrypoint: one task, one pod.
+"""
 
 import argparse
 import logging
+import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -11,14 +16,22 @@ import uvicorn
 
 from robo_worker.asker import Asker
 from robo_worker.config import Config, ConfigError, load_config
+from robo_worker.job_main import job_main
 from robo_worker.launcher import K8sLauncher
 from robo_worker.scheduler import Scheduler
 from robo_worker.secret_files import SecretError, load_callers
 from robo_worker.server import build_app
 from robo_worker.store import JobStore
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_CONFIG_HELP = "TOML config file (see config.example.toml)"
+
 
 async def serve(cfg: Config, callers: Mapping[str, str]) -> None:
+    home = os.environ.get("HOME")
+    if home:
+        # HOME is on the state claim in the cluster, and a new claim is empty.
+        Path(home).mkdir(parents=True, exist_ok=True)
     store = JobStore(cfg.state_root)
     scheduler = Scheduler(cfg, store, launch=K8sLauncher(cfg, cfg.job_template))
     scheduler.recover()
@@ -33,21 +46,33 @@ async def serve(cfg: Config, callers: Mapping[str, str]) -> None:
         tg.cancel_scope.cancel()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="robo-worker",
         description="Run claude -p jobs on repo checkouts and serve them over MCP.",
     )
-    parser.add_argument(
-        "--config", type=Path, required=True, help="TOML config file (see config.example.toml)"
-    )
-    args = parser.parse_args(argv)
-    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    logging.basicConfig(level=logging.INFO, format=log_format)
+    sub = parser.add_subparsers(dest="command", required=True)
+    control = sub.add_parser("serve", help="run the control plane (MCP, queues, launcher)")
+    control.add_argument("--config", type=Path, required=True, help=_CONFIG_HELP)
+    job = sub.add_parser("job", help="run one job in this pod, then exit")
+    job.add_argument("--config", type=Path, required=True, help=_CONFIG_HELP)
+    job.add_argument("--job-id", required=True, help="the job to run, as submit_job returned it")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
     try:
         cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(f"robo-worker: {exc}", file=sys.stderr)
+        return 2
+    if args.command == "job":
+        return job_main(cfg, args.job_id)
+    try:
         callers = load_callers(cfg.callers_file)
-    except (ConfigError, SecretError) as exc:
+    except SecretError as exc:
         print(f"robo-worker: {exc}", file=sys.stderr)
         return 2
     anyio.run(serve, cfg, callers)

@@ -160,6 +160,7 @@ _JOBS = st.builds(
     reason=st.none() | st.text(),
     started=st.booleans(),
     interruptions=st.integers(min_value=0),
+    attempts=st.integers(min_value=0),
     resume_prompt=st.none() | st.text(),
     resets_at=st.none() | _FINITE,
     result=st.none() | _FLAT,
@@ -170,6 +171,14 @@ _JOBS = st.builds(
 @given(_JOBS)
 def test_job_round_trips_through_json(job: Job) -> None:
     assert Job.from_dict(json.loads(json.dumps(job.to_dict()))) == job
+
+
+@given(_JOBS)
+def test_job_without_attempts_loads_with_zero(job: Job) -> None:
+    # A job file written before attempts existed has no such key.
+    data = job.to_dict()
+    del data["attempts"]
+    assert Job.from_dict(data).attempts == 0
 
 
 @given(_JOBS, st.text(min_size=1, max_size=10))

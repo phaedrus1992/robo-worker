@@ -1,0 +1,22 @@
+# The control plane creates, watches, and deletes the job Jobs and their token Secrets, and
+# reads its own Pod for the image and the config volume. No patch and no update: the
+# launcher only creates. Nothing cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: robo-worker
+  labels:
+    app.kubernetes.io/name: robo-worker
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]

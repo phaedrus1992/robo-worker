@@ -20,7 +20,7 @@ from robo_worker.scheduler import Scheduler
 from robo_worker.server import BearerAuth, bearer_token, build_app
 from robo_worker.states import JobState
 from robo_worker.store import JobStore
-from tests.conftest import AGENT_TOKEN, FIXTURES, make_origin
+from tests.conftest import AGENT_TOKEN, FIXTURES, make_origin, make_scheduler
 
 pytestmark = [pytest.mark.anyio, pytest.mark.usefixtures("isolated_git")]
 
@@ -31,7 +31,7 @@ def stack(config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tu
     monkeypatch.setenv("FAKE_CLAUDE_FIXTURES", fixtures)
     monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(tmp_path / "record.jsonl"))
     store = JobStore(config.state_root)
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     asker = Asker(config, store, scheduler.pauses)
     callers = {AGENT_TOKEN: "agent"}
     return scheduler, build_app(config, scheduler, asker, callers)
@@ -170,7 +170,7 @@ async def test_ask_tool(
 ) -> None:
     monkeypatch.setenv("FAKE_CLAUDE_FIXTURES", str(FIXTURES / "ask_success.jsonl"))
     store = JobStore(config.state_root)
-    scheduler = Scheduler(config, store)
+    scheduler = make_scheduler(config, store)
     asker = Asker(config, store, scheduler.pauses)
     app = build_app(config, scheduler, asker, {AGENT_TOKEN: "agent"})
     async with serving(app, scheduler) as base, mcp_client(base, AGENT_TOKEN) as client:

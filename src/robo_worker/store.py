@@ -45,6 +45,8 @@ class Job:
     reason: str | None = None
     started: bool = False
     interruptions: int = 0
+    # Pod runs so far. The launcher names each k8s Job from it, so no two runs share a name.
+    attempts: int = 0
     resume_prompt: str | None = None
     resets_at: float | None = None
     result: dict[str, Any] | None = None
@@ -89,12 +91,6 @@ class JobStore:
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise UnknownJob(job_id)
         return self._jobs / job_id
-
-    def stream_path(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "stream.jsonl"
-
-    def stderr_path(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "stderr.log"
 
     def create(self, *, repo: str, prompt: str, tags: list[str], caller: str) -> Job:
         now = self._clock()

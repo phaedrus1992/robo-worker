@@ -1,4 +1,4 @@
-"""Read and write secret files with owner-only permissions."""
+"""Read secret files that only this user or group can read, and write owner-only files."""
 
 import contextlib
 import os
@@ -20,17 +20,21 @@ class SecretError(RuntimeError):
 
 def _check_mode(path: Path) -> None:
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
+        info = path.stat()
     except OSError as exc:
         raise SecretError(f"cannot read secret file {path}: {exc}") from exc
-    if mode & 0o077:
+    mode = stat.S_IMODE(info.st_mode)
+    # A k8s Secret volume file is root:<fsGroup> 0440 or 0640, so a group read by the
+    # service's own group is safe. Any other group bit, or any bit for others, is not.
+    own_group_read = info.st_gid == os.getegid() and not mode & 0o030
+    if mode & 0o007 or (mode & 0o070 and not own_group_read):
         raise SecretError(
-            f"secret file {path} is readable by group or others. Run: chmod 600 {path}"
+            f"secret file {path} is open to another group or to others. Run: chmod 600 {path}"
         )
 
 
 def read_secret(path: Path) -> str:
-    """Return the stripped content of an owner-only secret file."""
+    """Return the stripped content of a secret file that only this user or group can read."""
     _check_mode(path)
     text = path.read_text(encoding="utf-8").strip()
     if not text:

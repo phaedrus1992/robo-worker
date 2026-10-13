@@ -1,21 +1,26 @@
 # robo-worker config. Every key is required.
 
 [server]
-# The LAN address to bind. Callers reach the MCP endpoint at <public_url>/mcp.
-listen_host = "192.168.1.20"
+# The address to bind inside the pod. The pod IP is not known in advance.
+listen_host = "0.0.0.0"
 listen_port = 8765
-# The worker's own Claude session calls report_progress at this URL.
-public_url = "http://192.168.1.20:8765"
-# Host header values the MCP transport accepts (DNS rebinding protection).
-allowed_hosts = ["192.168.1.20:8765"]
+# The job pod's Claude session calls report_progress at this URL, through in-cluster DNS.
+public_url = "http://robo-worker.phaedrus.svc:8765"
+# Host header values the MCP transport accepts (DNS rebinding protection): the in-cluster
+# name for job pods, and the NodePort address for callers on the LAN.
+allowed_hosts = ["robo-worker.phaedrus.svc:8765", "192.168.211.10:30875"]
 
 [paths]
-workspace_root = "/home/robo-worker/work"
-state_root = "/home/robo-worker/state"
-# TOML file, mode 0600: [callers] with one `name = "token"` line per caller.
-callers_file = "/home/robo-worker/secrets/callers.toml"
-# Output of `claude setup-token`, mode 0600.
-oauth_token_file = "/home/robo-worker/secrets/claude-oauth-token"
+# Both of these are claim mounts, shared by the control plane and by every job pod.
+workspace_root = "/work"
+state_root = "/state"
+# The job pod template, from the ConfigMap that kustomize generates. See deploy/k8s/job-pod.json.
+job_template = "/etc/robo-worker/config/job-pod.json"
+# Mounted from the robo-worker-secrets Secret. TOML file, no access for others: [callers] with one
+# `name = "token"` line per caller.
+callers_file = "/etc/robo-worker/secrets/callers.toml"
+# Output of `claude setup-token`, from the same Secret. The launcher copies it to each job pod.
+oauth_token_file = "/etc/robo-worker/secrets/claude-oauth-token"
 
 [auth]
 # The date of the `claude setup-token` run. The token is valid for one year.
@@ -25,8 +30,10 @@ token_warn_days = 30
 allowed_key_sources = ["none"]
 
 [limits]
+# Concurrent job pods, not threads.
 max_parallel_jobs = 2
 max_parallel_asks = 2
+# The job pod's activeDeadlineSeconds is the same value, so both clocks agree.
 max_job_seconds = 14400
 max_ask_seconds = 300
 # Limit for each git and llmenv command that prepares a job.
@@ -46,12 +53,17 @@ deny_bundles = []
 # Output styles that stop a job when the init event reports them.
 deny_output_styles = ["ben"]
 # Names copied from the service environment into the worker environment.
-extra_env = ["GH_CONFIG_DIR"]
+extra_env = ["GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "DISABLE_AUTOUPDATER"]
+
+[k8s]
+# The namespace the control plane creates Job objects in. It already exists.
+namespace = "phaedrus"
 
 [bins]
 claude = "claude"
 llmenv = "llmenv"
 git = "git"
+kubectl = "kubectl"
 
 [git]
 clone_url_template = "https://github.com/{owner}/{name}.git"

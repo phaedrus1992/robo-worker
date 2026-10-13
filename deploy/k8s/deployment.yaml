@@ -1,0 +1,122 @@
+# The control plane: MCP server, queues, and the job launcher. One replica, because it is
+# the only writer of the job store. maxSurge 0 keeps two control planes from overlapping.
+# Job pods run under their own Job objects, so a rollout here does not stop them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robo-worker
+  labels:
+    app.kubernetes.io/name: robo-worker
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: robo-worker
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: robo-worker
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: robo-worker
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        # The NFS driver has fsGroupPolicy File: without this, each mount changes the owner
+        # of every file on the claim, and a large checkout makes that slow.
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-plane
+          image: ghcr.io/phaedrus1992/robo-worker
+          args: ["serve", "--config", "/etc/robo-worker/config/config.toml"]
+          env:
+            # On the state claim: claude -p --resume reads its session state from ~/.claude.
+            - name: HOME
+              value: /state/home
+            # The launcher reads its own Pod for the image and the config volume.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: mcp
+              containerPort: 8765
+          # tcpSocket, not /health: /health returns 503 during an auth pause, and a probe on
+          # it would restart the pod in a loop and drop the Service endpoint callers need.
+          readinessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: mcp
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: state
+              mountPath: /state
+            - name: config
+              mountPath: /etc/robo-worker/config
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/robo-worker/secrets
+              readOnly: true
+            - name: gh
+              mountPath: /etc/robo-worker/gh
+              readOnly: true
+            - name: git
+              mountPath: /etc/robo-worker/git
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: robo-worker-work
+        - name: state
+          persistentVolumeClaim:
+            claimName: robo-worker-state
+        - name: config
+          configMap:
+            name: robo-worker-config
+        # 0440: the pod reads these as group 10001 through fsGroup, and others get nothing.
+        - name: secrets
+          secret:
+            secretName: robo-worker-secrets
+            defaultMode: 0440
+        - name: gh
+          secret:
+            secretName: robo-worker-gh
+            defaultMode: 0440
+        - name: git
+          secret:
+            secretName: robo-worker-git
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}

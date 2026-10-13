@@ -18,19 +18,14 @@ Design: RoboPhaedrus1992/agent `docs/superpowers/specs/2026-10-11-robo-worker-de
 - A worker runs `claude -p` with `bypassPermissions` and runs the code of the repo it checks out, such as its tests.
   That code sees the plan OAuth token in its environment.
   Submit only repos that you trust.
-- The server and its workers share the unix user `robo-worker`, so a worker can read the caller tokens and change the service files.
-  Issue #1 tracks a separate user for the workers.
+- Each attempt of a job runs in its own job pod. A job pod mounts only its own job directory and its own repo checkout. It does not mount the caller tokens, and it has no access to the k8s API. The control plane never runs a program on data that a job pod wrote. Details: `docs/deploy.md`, "What a job pod can reach".
+- Jobs on the same repo share its checkout, so a job can leave a git hook there for the next job on that repo.
 - `default_tags`, `deny_tags`, and `deny_bundles` are denylists.
   A tag or bundle that the llmenv config adds later is open to jobs until you deny it.
 
-## Operations
+## Running it
 
-- Host setup: `docs/host-setup.md`.
-- Deploy: `scripts/deploy.sh <ssh-host> http://<lan-address>:<port>/health [git-ref]`.
-  The script refuses to restart while jobs run, or when it cannot read the job count, unless you pass `--force`.
-  Exit codes: 0 deployed, 2 usage, 3 rolled back, 4 rollback failed, 5 refused, 6 nothing changed (cannot read or fetch on the host).
-- Health: `GET /health` needs no token. It returns 503 when a job cannot run.
-- Job files: `<state_root>/jobs/<id>/` holds `job.json`, `events.jsonl`, `stream.jsonl`, `stderr.log`, and `mcp.json`.
-- Usage: `<state_root>/usage.jsonl` has one line for each job run and each ask.
-- A paused repo queue (`checkout_dirty`): clean the checkout under `workspace_root`, then call `resume_queue`.
-- An auth pause: replace the token file, update `auth.oauth_token_created`, and restart the unit.
+    robo-worker serve --config <config>                 # the control plane, in the cluster
+    robo-worker job --config <config> --job-id <id>     # one task, in a job pod
+
+Deployment, secrets, and operations: `docs/deploy.md`.

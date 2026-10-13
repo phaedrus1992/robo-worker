@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The namespace exists already and is not ours to create: the deploy identity is a
+# namespaced admin, not a cluster admin.
+namespace: phaedrus
+resources:
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
+  - pvc-workspace.yaml
+  - pvc-state.yaml
+  - service.yaml
+  - deployment.yaml
+configMapGenerator:
+  # The name gets a content hash, so a config change rolls the Deployment. The launcher
+  # copies this volume from its own pod, because job-pod.json cannot know the hash.
+  - name: robo-worker-config
+    files:
+      - config.toml
+      - job-pod.json
+images:
+  - name: ghcr.io/phaedrus1992/robo-worker
+    newTag: main

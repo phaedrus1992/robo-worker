@@ -1,0 +1,12 @@
+# The StorageClass has reclaimPolicy Delete: to delete this claim is to delete state_root.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: robo-worker-state
+  labels:
+    app.kubernetes.io/name: robo-worker
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 5Gi

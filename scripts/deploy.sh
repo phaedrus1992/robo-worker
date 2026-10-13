@@ -1,73 +1,124 @@
 #!/usr/bin/env bash
-# Usage: scripts/deploy.sh [--force] <ssh-host> <health-url> [git-ref]
+# Usage: scripts/deploy.sh [--force] [git-ref]
 #
-# Deploy robo-worker on <ssh-host>: check out <git-ref> (default origin/main), run uv sync,
-# restart the unit, and check <health-url>. Revert to the previous commit when that fails.
-# --force deploys even when jobs run, or when the running job count cannot be read;
-# the restart interrupts the jobs, and they resume later.
+# Deploy robo-worker to the phaedrus namespace. Check <git-ref> (default origin/main) out
+# into a deploy worktree, apply deploy/k8s from it, wait for the control-plane rollout, and
+# check its /health. Undo the rollout to the revision that ran before when either fails.
+# The manifests in <git-ref> name the image tag. --force deploys even when a job Job is
+# active, or when the active jobs cannot be counted.
 #
-# Exit codes: 0 deployed, 2 usage, 3 rolled back, 4 rollback failed, 5 refused (jobs running
-# or count unknown), 6 cannot read or fetch the checkout on the host (nothing changed).
+# Exit codes: 0 deployed, 2 usage, 3 rolled back and healthy, 4 rollback failed or unhealthy
+# or nothing to roll back to, 5 refused (jobs active or count unknown), 6 nothing changed
+# (cannot fetch, check out, or read the Deployment).
 set -euo pipefail
 
-APP_DIR="${ROBO_WORKER_APP_DIR:-/home/robo-worker/robo-worker}"
-UNIT="${ROBO_WORKER_UNIT:-robo-worker}"
-HEALTH_TRIES="${ROBO_WORKER_HEALTH_TRIES:-15}"
+APP_DIR="${ROBO_WORKER_APP_DIR:-$HOME/git/robo-worker}"
+DEPLOY_DIR="${ROBO_WORKER_DEPLOY_DIR:-$HOME/.cache/robo-worker-deploy}"
+NAMESPACE="${ROBO_WORKER_NAMESPACE:-phaedrus}"
+HEALTH_TRIES="${ROBO_WORKER_HEALTH_TRIES:-30}"
 HEALTH_DELAY="${ROBO_WORKER_HEALTH_DELAY:-2}"
+DEPLOYMENT="deployment/robo-worker"
+# The API server proxies to the Service, so this needs no LAN route and no port-forward.
+HEALTH_URL="/api/v1/namespaces/$NAMESPACE/services/robo-worker:8765/proxy/health"
+REVISION_KEY="deployment.kubernetes.io/revision"
 
 usage() {
-  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
-# The commands go to the remote shell on stdin, so no argument needs a second level of quoting.
-as_worker() {
-  ssh "$HOST" sudo -u robo-worker -H bash -l -s <<<"set -euo pipefail; cd '$APP_DIR'; $1"
+kc() {
+  kubectl -n "$NAMESPACE" "$@"
 }
 
-restart() {
-  # The sudoers rule allows this exact argv only, so it cannot go through `bash -s`.
-  # main checks the shape of UNIT, so the client-side expansion is safe.
-  # shellcheck disable=SC2029
-  ssh "$HOST" sudo systemctl restart "$UNIT" </dev/null
+# Count the active job Jobs through the API server, not through /health: an unhealthy
+# control plane must not hide a running job.
+running_jobs() {
+  local body
+  body="$(kc get jobs -l robo-worker/job-id -o json)" || return 1
+  jq '[.items[] | select((.status.active // 0) > 0)] | length' <<<"$body"
 }
 
-deploy_rev() {
-  as_worker "git checkout -q --detach $1 && uv sync --frozen -q"
+# Print the revision of the Deployment, or nothing when it does not exist yet.
+current_revision() {
+  local body
+  body="$(kc get "$DEPLOYMENT" --ignore-not-found -o json)" || return 1
+  [[ -n "$body" ]] || return 0
+  jq -r --arg key "$REVISION_KEY" '.metadata.annotations[$key] // ""' <<<"$body"
 }
 
-# Set HEALTH_CODE and HEALTH_BODY. /health answers 503 with a JSON body when a job cannot
-# run, so the body is read on both codes. Return 1 only when there is no answer at all.
-health_get() {
-  local out
-  HEALTH_CODE="" HEALTH_BODY=""
-  out="$(curl -sS --max-time 5 -w '\n%{http_code}' "$HEALTH_URL")" || return 1
-  HEALTH_CODE="${out##*$'\n'}"
-  HEALTH_BODY="${out%$'\n'*}"
+checkout_ref() {
+  git -C "$APP_DIR" fetch -q origin || return 1
+  if [[ -e "$DEPLOY_DIR/.git" ]]; then
+    git -C "$DEPLOY_DIR" checkout -q --detach "$1"
+  else
+    mkdir -p "$(dirname "$DEPLOY_DIR")"
+    git -C "$APP_DIR" worktree add -q --detach "$DEPLOY_DIR" "$1"
+  fi
 }
 
 healthy() {
-  local i
+  local i body="" err
+  err="$(mktemp)"
   for ((i = 0; i < HEALTH_TRIES; i++)); do
-    if health_get && [[ "$HEALTH_CODE" == "200" ]]; then
+    if body="$(kc get --raw "$HEALTH_URL" 2>"$err")" &&
+      jq -e '.ok == true' <<<"$body" >/dev/null; then
+      rm -f "$err"
       return 0
     fi
-    # The unit needs a few seconds to bind its port after a restart, and sends no signal.
+    # The new pod needs a few seconds to bind its port, and sends no signal.
     sleep "$HEALTH_DELAY"
   done
-  echo "deploy: $HEALTH_URL is not healthy (HTTP ${HEALTH_CODE:-none})." >&2
-  jq -r '.problems[]? | "deploy:   problem: \(.)"' <<<"$HEALTH_BODY" >&2 2>/dev/null || true
+  echo "deploy: /health of the robo-worker Service is not ok." >&2
+  jq -r '.problems[]? | "deploy:   problem: \(.)"' <<<"$body" >&2 2>/dev/null || true
+  if [[ -s "$err" ]]; then
+    echo "deploy:   kubectl: $(tail -n 1 "$err")" >&2
+  fi
+  rm -f "$err"
   return 1
 }
 
-# Print the running job count, or "unknown" when the service gives none.
-running_jobs() {
-  if ! health_get || [[ "$HEALTH_CODE" != "200" && "$HEALTH_CODE" != "503" ]]; then
-    echo unknown
-    return
+apply_and_wait() {
+  kc apply -k "$DEPLOY_DIR/deploy/k8s" >/dev/null &&
+    kc rollout status "$DEPLOYMENT" --timeout=300s >/dev/null &&
+    healthy
+}
+
+roll_back() {
+  local old="$1" now
+  if [[ -z "$old" ]]; then
+    echo "deploy: this was the first deploy, so no revision exists to roll back to." >&2
+    return 1
   fi
-  jq -r 'if (.running | type) == "number" then .running else "unknown" end' \
-    <<<"$HEALTH_BODY" 2>/dev/null || echo unknown
+  now="$(current_revision)" || return 1
+  if [[ "$now" == "$old" ]]; then
+    # The Deployment did not change. An undo here would go back one more revision.
+    echo "deploy: the Deployment is still at revision $old, so it needs no undo." >&2
+  else
+    kc rollout undo "$DEPLOYMENT" --to-revision="$old" >/dev/null &&
+      kc rollout status "$DEPLOYMENT" --timeout=300s >/dev/null || return 1
+  fi
+  # An undo reverts the Deployment only. The other objects from the ref stay applied.
+  echo "deploy: other objects from the ref (Role, Service, claims, ConfigMap) stay applied." >&2
+  healthy
+}
+
+refuse_if_busy() {
+  local force="$1" running
+  if ! running="$(running_jobs)"; then
+    if [[ "$force" -eq 0 ]]; then
+      echo "deploy: cannot count the active jobs in $NAMESPACE." \
+        "Fix kubectl access, or use --force." >&2
+      exit 5
+    fi
+    echo "deploy: warning: cannot count the active jobs, and --force deploys anyway." >&2
+    return 0
+  fi
+  if [[ "$running" != "0" && "$force" -eq 0 ]]; then
+    echo "deploy: $running job(s) active. A rollout stops none of them, but a config" \
+      "change can change how the control plane reads them. Wait, or use --force." >&2
+    exit 5
+  fi
 }
 
 main() {
@@ -76,53 +127,33 @@ main() {
     force=1
     shift
   fi
-  [[ $# -ge 2 && $# -le 3 ]] || usage
-  HOST="$1"
-  HEALTH_URL="$2"
-  local ref="${3:-origin/main}"
+  [[ $# -le 1 ]] || usage
+  local ref="${1:-origin/main}"
   # Shape only: no shell characters, and no leading "-" that git would read as an option.
   [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ && "$ref" != -* ]] || usage
-  # ssh and curl read a leading "-" as an option.
-  [[ "$HOST" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || usage
-  [[ "$HEALTH_URL" =~ ^https?://[^[:space:]]+$ ]] || usage
-  # Both values reach a remote shell, so they must hold no quote or shell character.
-  [[ "$UNIT" =~ ^[A-Za-z0-9@._-]+$ && "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || {
-    echo "deploy: ROBO_WORKER_UNIT or ROBO_WORKER_APP_DIR has an unsafe character" >&2
-    exit 2
-  }
 
-  local running
-  running="$(running_jobs)"
-  if [[ "$running" == "unknown" && "$force" -eq 0 ]]; then
-    echo "deploy: cannot read the running job count from $HEALTH_URL." \
-      "Check the service, or use --force." >&2
-    exit 5
-  fi
-  if [[ "$running" != "0" && "$running" != "unknown" && "$force" -eq 0 ]]; then
-    echo "deploy: $running job(s) running. A restart interrupts them. Wait, or use --force." >&2
-    exit 5
-  fi
-
-  local old=""
-  old="$(as_worker 'git rev-parse HEAD')" || true
-  [[ "$old" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "deploy: cannot read the current commit on $HOST (got '$old'). Nothing changed." >&2
+  refuse_if_busy "$force"
+  local old
+  old="$(current_revision)" || {
+    echo "deploy: cannot read $DEPLOYMENT in $NAMESPACE. Nothing changed." >&2
     exit 6
   }
-  as_worker "git fetch -q origin" || {
-    echo "deploy: git fetch failed on $HOST. Nothing changed." >&2
+  checkout_ref "$ref" || {
+    echo "deploy: cannot fetch or check out $ref in $APP_DIR. Nothing changed." >&2
     exit 6
   }
 
-  if deploy_rev "$ref" && restart && healthy; then
-    echo "deploy: $ref is live on $HOST"
+  if apply_and_wait; then
+    echo "deploy: $ref is live in the $NAMESPACE namespace"
     exit 0
   fi
-  echo "deploy: $ref failed on $HOST. Rolling back to $old." >&2
-  if deploy_rev "$old" && restart && healthy; then
+  echo "deploy: $ref failed. Rolling back." >&2
+  if roll_back "$old"; then
+    echo "deploy: rolled back to revision $old, and it is healthy." >&2
     exit 3
   fi
-  echo "deploy: the rollback failed. $HOST needs a manual fix." >&2
+  echo "deploy: the rollback failed, or the old revision is not healthy." \
+    "The cluster needs a manual fix." >&2
   exit 4
 }
 

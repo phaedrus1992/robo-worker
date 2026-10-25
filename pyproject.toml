@@ -9,7 +9,7 @@ dependencies = [
   "anyio==4.15.1",
   "mcp==2.3.0",
   "pydantic==2.14.1",
-  "starlette==1.7.0",
+  "starlette==1.8.0",
   "uvicorn==0.54.0",
 ]
 
@@ -19,10 +19,10 @@ robo-worker = "robo_worker.cli:main"
 [dependency-groups]
 dev = [
   "httpx2==2.13.1",
-  "hypothesis==6.168.5",
+  "hypothesis==6.170.1",
   "pytest==9.1.1",
-  "ruff==0.17.0",
-  "ty==0.0.86",
+  "ruff==0.17.1",
+  "ty==0.0.89",
 ]
 
 [build-system]

@@ -8,8 +8,8 @@ license = "MIT"
 dependencies = [
   "anyio==4.15.1",
   "mcp==2.3.0",
-  "pydantic==2.14.1",
-  "starlette==1.7.0",
+  "pydantic==2.14.2",
+  "starlette==1.10.0",
   "uvicorn==0.54.0",
 ]
 
@@ -18,15 +18,15 @@ robo-worker = "robo_worker.cli:main"
 
 [dependency-groups]
 dev = [
-  "httpx2==2.13.1",
-  "hypothesis==6.168.5",
-  "pytest==9.1.1",
-  "ruff==0.17.0",
-  "ty==0.0.86",
+  "httpx2==2.16.0",
+  "hypothesis==6.170.14",
+  "pytest==9.2.0",
+  "ruff==0.17.3",
+  "ty==0.0.95",
 ]
 
 [build-system]
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
